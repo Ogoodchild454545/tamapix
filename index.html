@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#4fb3ff">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>TAMA-PIX — meadow pet</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body data-mode="main" data-env="day">
+  <canvas id="scene" aria-label="Your pet in the meadow. Tap the choices shown on screen."></canvas>
+
+  <nav class="bar top" id="barTop" aria-label="Care actions"></nav>
+  <nav class="bar bottom" id="barBottom" aria-label="More actions"></nav>
+
+  <!-- Friend-code panel, opened from BATTLE › FRIEND -->
+  <div class="modal" id="linkPanel" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="linkTitle">
+      <h2 id="linkTitle">Friend battle</h2>
+      <p class="lbl">Your pet's code — send it to a friend:</p>
+      <div class="coderow"><code id="myCode">…</code><button id="copyCode" type="button">Copy</button></div>
+      <label class="lbl" for="friendCode">Paste your friend's code:</label>
+      <input id="friendCode" placeholder="TP-..." spellcheck="false" autocomplete="off" autocapitalize="off" inputmode="text">
+      <p class="err" id="linkError" role="alert"></p>
+      <div class="actions">
+        <button id="linkClose" type="button" class="ghost">Back</button>
+        <button id="linkFight" type="button">Battle!</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/config.js"></script>
+  <script src="js/sprites.js"></script>
+  <script src="js/scene.js"></script>
+  <script src="js/evolution.js"></script>
+  <script src="js/audio.js"></script>
+  <script src="js/personality.js"></script>
+  <script src="js/pet.js"></script>
+  <script src="js/battle.js"></script>
+  <script src="js/net.js"></script>
+  <script src="js/debug.js"></script>
+  <script src="js/game.js"></script>
+</body>
+</html>

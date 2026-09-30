@@ -1,0 +1,13 @@
+# Render Blueprint: one free Node web service that serves the game and the WebSocket endpoint (/ws).
+# Deploy: https://render.com/deploy?repo=<public GitHub URL of this repo>   (or New > Blueprint in the dashboard)
+services:
+  - type: web
+    name: tamapix
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeployTrigger: commit
+    # Node version comes from .node-version; PORT is injected by Render and HOST defaults to 0.0.0.0.
