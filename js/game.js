@@ -1,22 +1,23 @@
 /* TAMA-PIX — UI controller: tap/keyboard input, menus, animations, mini-game, battles, main loop.
  *
- * Rendering: a full-screen pixel-art scene (scene.js). Gameplay is drawn on a 48x24 "stage" standing on the
- * meadow; negative y reaches up into the sky (used for labels and overlay panels).
- * Input: HUD buttons along the top/bottom (tap = run that action, ↩ = back) and tappable "zones" that each
- * screen registers while drawing (see zone()). Keyboard is optional: 1/A next, 2/B ok, 3/C back, M mute.
+ * Rendering: full-screen GBA-style scene (scene.js). Gameplay is drawn on a 96x48 "stage" (the dirt path in the
+ * meadow); negative y reaches up into the sky, used for panels and labels. Battles use a Gen-3 style layout that
+ * spans the whole visible area (S.bounds()).
+ * Input: HUD buttons along the top/bottom + tappable "zones" registered while drawing (see zone()); each zone can
+ * carry an id so tests/tools can find it. Keyboard is optional: 1/A next, 2/B ok, 3/C back, M mute.
  */
 (function (T) {
   'use strict';
-  const C = T.CONFIG, U = T.util, SPR = T.SPR, Pet = T.Pet, A = T.Audio;
-  const W = C.STAGE_W, H = C.STAGE_H;
-  const INK = T.INK, RED = '#e8263b', WATER = '#5ec8ff';
+  const C = T.CONFIG, U = T.util, SPR = T.SPR, Pet = T.Pet, A = T.Audio, UI = T.UI;
+  const W = C.STAGE_W, H = C.STAGE_H, FOOT = H - 2;
   const ICONS = ['feed', 'light', 'play', 'medicine', 'bath', 'status', 'discipline', 'battle'];
   const TOP_BAR = ['feed', 'light', 'play', 'medicine', 'bath'];
-  const LABELS = { feed: 'Feed', light: 'Light', play: 'Play', medicine: 'Medicine', bath: 'Clean up', status: 'Status',
+  const LABELS = { feed: 'Feed', light: 'Light', play: 'Train', medicine: 'Medicine', bath: 'Clean up', status: 'Status',
                    discipline: 'Discipline', battle: 'Battle', attention: 'Needs attention', back: 'Back', sound: 'Sound' };
-  const TITLES = { feedMenu: 'FEED', lightMenu: 'LIGHT', battleMenu: 'BATTLE' };
+  const TITLES = { feedMenu: 'FEED', lightMenu: 'LIGHTS', battleMenu: 'BATTLE' };
   const STATUS_PAGES = 5;
-  const POOP_SLOTS = [[40, 17], [40, 10], [40, 3], [32, 17]];
+  const EMOTE_COL = { heart: '#c9505a', note: '#9fb3d1', angry: '#d0503c', zzz: '#9fb0d0', sweat: '#7fb4d8',
+                      question: '#d8dde6', food: '#d8c9a0', skull: '#d8dde6', excl: UI.accent };
 
   let S, hud = {}, state, ui, lastReal = Date.now(), lastSave = 0;
 
@@ -24,7 +25,7 @@
     return {
       mode: 'main', sel: -1, sub: 0, page: 0,
       anim: null, queue: [], zones: [], tapFx: null, tapLock: 0, lastInput: 'tap',
-      pet: { x: 16, dir: 1, move: 'walk', lastStep: 0 }, petted: 0,
+      pet: { x: 30, dir: 1, move: 'walk', lastStep: 0 }, petted: 0,
       emote: null, emoteUntil: 0, nextThink: 0, thought: '',
       play: null, battle: null, search: null, lastCallBeep: 0, fallbackReason: null
     };
@@ -32,17 +33,19 @@
 
   // ---------------------------------------------------------------- helpers
   const now = () => performance.now();
-  const petKey = (id) => (SPR[id || state.formId] ? (id || state.formId) : 'pixbit');
-  const petSpr = (id) => SPR[petKey(id)];
+  const petKey = (id) => (T.Monsters.has(id || state.formId) ? (id || state.formId) : 'pixbit');
+  const sz = (k) => S.size(k);
   const blink = (t, ms) => Math.floor(t / (ms || 400)) % 2 === 0;
-  const groundY = (b) => H - b.h;
-  function rightLimit() { const n = state.poops.length; return n >= 4 ? 31 : n ? 39 : W; }
+  const groundY = (k) => FOOT - sz(k).h + 1;
+  const formName = (id) => (T.FORMS[id] || T.FORMS.pixbit).name;
+  const poopSlot = (i) => [W - 12 - i * 11, FOOT - 6];
+  function rightLimit() { return W - 2 - Math.min(4, state.poops.length) * 11; }
 
-  /** Register a tappable area (stage coords) for the frame being drawn; box = area to flash when tapped. */
-  function zone(x, y, w, h, fn, box) { ui.zones.push({ x, y, w, h, fn, box: box || null }); }
+  /** Register a tappable area (stage coords). box = area to flash; id = stable name for tests/tools. */
+  function zone(x, y, w, h, fn, box, id) { ui.zones.push({ x, y, w, h, fn, box: box || null, id: id || null }); }
 
-  function startAnim(dur, draw, onEnd, onStart, env) {
-    const a = { dur, draw, onEnd, onStart, env, t0: 0 };
+  function startAnim(dur, draw, onEnd, onStart) {
+    const a = { dur, draw, onEnd, onStart, t0: 0 };
     if (ui.anim) ui.queue.push(a); else begin(a);
   }
   function begin(a) { a.t0 = now(); ui.anim = a; if (a.onStart) a.onStart(); }
@@ -54,64 +57,50 @@
   function back() { ui.mode = 'main'; ui.sub = 0; }
 
   function drawPet(key, x, y, flip, opts) {
-    const b = SPR[key];
-    S.shadow(x, H, b.w);
-    S.art(key, x, y, Object.assign({ flip }, opts || {}));
+    S.shadow(x, FOOT + 1, sz(key).w);
+    S.art(key, x, y, Object.assign({ flip, frame: S.frame }, opts || {}));
   }
   function drawEmote(name, px, py, pw) {
-    const b = SPR.bubble;
-    let x = px + pw - 1, flip = false;
-    if (x + b.w > Math.min(W, rightLimit() + 2)) { x = px - b.w + 1; flip = true; }
-    x = U.clamp(x, -2, W - b.w + 2);
-    const y = py - 8;
-    S.art('bubble', x, y, { flip });
-    S.glyph('e_' + name, x + 3, y + 2);
-  }
-  function drawHearts(n, y) {
-    const x0 = Math.floor((W - 27) / 2);
-    for (let i = 0; i < 4; i++) S.art(i < n ? 'heartFull' : 'heartEmpty', x0 + i * 7, y);
+    const x = U.clamp(px + pw - 3, -4, W - 2), y = py - 7;
+    S.emote('e_' + name, x, y, EMOTE_COL[name]);
   }
   function drawPoops(t) {
-    state.poops.forEach((p, i) => S.art('poop', POOP_SLOTS[i][0], POOP_SLOTS[i][1]));
-    const n = Math.min(3, state.poops.length);
-    if (n) S.glyph(blink(t, 500) ? 'stink1' : 'stink2', 42, POOP_SLOTS[n - 1][1] - 5);
+    state.poops.forEach((p, i) => { if (i < 4) { const [x, y] = poopSlot(i); S.art('dung', x, y); } });
+    if (state.poops.length && blink(t, 700)) S.glyph('stink1', poopSlot(0)[0] + 3, FOOT - 11, 'rgba(160,150,110,0.55)');
   }
   function drawSparkles(t, cx, cy) {
-    const r = 9 + (Math.floor(t / 150) % 3);
+    const r = 16 + (Math.floor(t / 150) % 3);
     [[-1, -1], [1, -1], [-1, 1], [1, 1]].forEach(([dx, dy], i) => {
-      if ((Math.floor(t / 150) + i) % 2) S.glyph('sparkle', cx + dx * r - 2, cy + dy * (r - 3) - 2);
+      if ((Math.floor(t / 150) + i) % 2) S.glyph('sparkle', cx + dx * r - 2, cy + dy * (r - 6) - 2, '#e8dca0');
     });
   }
-  function button(x, y, w, h, label, hi, icon) {
-    S.panel(x, y, w, h, hi ? S.HILITE : null);
-    S.text(label, x + 3, y + Math.floor((h - 5) / 2));
-    if (icon) S.art(icon, x + w - SPR[icon].w - 3, y + Math.floor((h - SPR[icon].h) / 2));
-  }
+  function dim() { S.overlay('rgba(6, 8, 14, 0.45)'); }
 
-  /** Stacked choices on a panel. opts: [{label, icon, fn}] (2 or 3 items). */
+  /** Stacked choices on dark panels. opts: [{label, icon, fn}] (2 or 3 items). */
   function drawOptions(opts, title) {
-    const n = opts.length, boxH = n === 2 ? 10 : 9, gap = n === 2 ? 3 : 2;
-    const total = n * boxH + (n - 1) * gap, y0 = Math.round(H / 2 - total / 2), x = 4, w = 40;
-    if (title) S.label(title, y0 - 10);
+    const n = opts.length, boxH = 15, gap = 4, w = 72, x = Math.floor((W - w) / 2);
+    const total = n * boxH + (n - 1) * gap, y0 = Math.round(H / 2 - total / 2) - 4;
+    if (title) S.label(title, y0 - 14, UI.accent);
     opts.forEach((o, i) => {
-      const y = y0 + i * (boxH + gap);
-      button(x, y, w, boxH, o.label, ui.lastInput === 'key' && ui.sub === i, o.icon);
-      const zt = i === 0 ? y0 - 14 : y - Math.floor(gap / 2), zb = i === n - 1 ? H + 12 : y + boxH + Math.ceil(gap / 2);
-      zone(-8, zt, W + 16, zb - zt, o.fn, { x, y, w, h: boxH });
+      const y = y0 + i * (boxH + gap), hi = ui.lastInput === 'key' && ui.sub === i;
+      S.panel(x, y, w, boxH, hi ? UI.accent : null);
+      S.text(o.label, x + 6, y + 5, hi ? UI.accent : UI.text);
+      if (o.icon) { const a = sz(o.icon); S.art(o.icon, x + w - a.w - 4, y + Math.floor((boxH - a.h) / 2)); }
+      const zt = i === 0 ? y0 - 30 : y - Math.floor(gap / 2), zb = i === n - 1 ? H + 30 : y + boxH + Math.ceil(gap / 2);
+      zone(-20, zt, W + 40, zb - zt, o.fn, { x, y, w, h: boxH }, 'opt' + i);
     });
   }
 
   function envFor() {
-    if (ui.mode === 'battle') return 'arena';
-    if (state.dead) return 'dusk';
+    if (ui.mode === 'battle') return 'battle';
     if (state.lightsOff) return 'night';
-    if (state.asleep) return 'dusk';
+    if (state.asleep || state.dead) return 'dusk';
     return 'day';
   }
 
   // ---------------------------------------------------------------- main idle screen
   function updatePet(t) {
-    const b = petSpr(), p = ui.pet;
+    const k = petKey(), b = sz(k), p = ui.pet;
     if (state.stage === 'egg' || state.dead) return;
     if (t >= ui.nextThink) {
       const d = T.Personality.think(state);
@@ -121,226 +110,243 @@
       ui.nextThink = t + U.rand(3000, 6000);
     }
     if (state.asleep) { p.x = Math.round((rightLimit() - b.w) / 2); return; }
-    if (t - p.lastStep > 500) {
+    if (t - p.lastStep > 450) {
       p.lastStep = t;
       if (p.move === 'walk' && t > ui.petted) {
-        if (U.chance(0.08)) p.dir *= -1;
+        if (U.chance(0.06)) p.dir *= -1;
         p.x += p.dir * 2;
       }
     }
     const maxX = rightLimit() - b.w - 1;
     if (p.x > maxX) { p.x = maxX; p.dir = -1; }
-    if (p.x < 1) { p.x = 1; p.dir = 1; }
+    if (p.x < 2) { p.x = 2; p.dir = 1; }
   }
 
   function drawMain(t, noZones) {
     if (state.dead) return drawDead(t);
     if (state.stage === 'egg') {
-      const b = SPR.egg, poked = t < ui.petted;
-      const wob = poked || state.eggMs > C.T.HATCH * 0.6 ? (blink(t, 120) ? 1 : -1) : (blink(t, 900) ? 0 : 1);
+      const b = sz('egg'), poked = t < ui.petted;
+      const wob = poked || state.eggMs > C.T.HATCH * 0.6 ? (blink(t, 120) ? 1 : -1) : 0;
       const x = Math.floor((W - b.w) / 2);
-      drawPet('egg', x + wob, groundY(b), false);
-      if (!noZones) zone(x - 4, -6, b.w + 8, H + 6, () => { ui.petted = now() + 800; });
+      drawPet('egg', x + wob, groundY('egg'), false);
+      if (!noZones) zone(x - 8, groundY('egg') - 10, b.w + 16, b.h + 14, () => { ui.petted = now() + 800; }, null, 'pet');
       return;
     }
-    const key = petKey(), b = SPR[key], p = ui.pet;
+    const key = petKey(), b = sz(key), p = ui.pet;
     const hop = !state.asleep && (p.move === 'hop' || t < ui.petted);
-    const bob = state.asleep ? 0 : (hop ? (blink(t, 250) ? -2 : 0) : (blink(t, 500) ? 0 : -1));
+    const bob = hop ? (blink(t, 220) ? -2 : 0) : 0;
     drawPoops(t);
-    drawPet(key, p.x, groundY(b) + bob, !state.asleep && p.dir < 0);
-    if (state.lightsOff) S.overlay('rgba(4, 6, 24, 0.38)');
+    // facing: sprites face left; flip when walking right
+    drawPet(key, p.x, groundY(key) + bob, !state.asleep && p.dir > 0, state.asleep ? { frame: 2 } : null);
+    if (state.lightsOff) S.overlay('rgba(3, 6, 24, 0.5)');
     if (state.asleep) {
-      const k = Math.floor(t / 600) % 4;
-      for (let i = 0; i < 3; i++) if (i <= k) S.text('Z', p.x + b.w + i * 4, groundY(b) - 3 - i * 5, state.lightsOff ? '#cfe0ff' : '#ffffff');
+      const k = Math.floor(t / 700) % 4;
+      for (let i = 0; i < 3; i++) if (i <= k) S.text('z', p.x + b.w - 2 + i * 4, groundY(key) + 2 - i * 5, state.lightsOff ? '#7f8fb0' : '#aab6cc');
     } else {
-      if (state.sick && blink(t, 500)) S.glyph('e_skull', p.x - 6, groundY(b) - 4);
-      if (ui.emote && t < ui.emoteUntil) drawEmote(ui.emote, p.x, groundY(b), b.w);
+      if (state.sick && blink(t, 600)) S.emote('e_skull', p.x - 7, groundY(key) + 2, EMOTE_COL.skull);
+      if (ui.emote && t < ui.emoteUntil) drawEmote(ui.emote, p.x, groundY(key), b.w);
     }
     if (noZones) return;
-    zone(p.x - 3, groundY(b) - 4, b.w + 6, b.h + 4, () => {
+    zone(p.x - 4, groundY(key) - 6, b.w + 8, b.h + 8, () => {
       ui.petted = now() + 1400;
       ui.emote = state.asleep ? 'angry' : state.sick ? 'sweat' : (state.happy >= 2 ? U.pick(['heart', 'note']) : 'question');
       ui.emoteUntil = now() + 1800; ui.nextThink = now() + 2500;
-    });
+    }, null, 'pet');
   }
 
   function drawDead(t) {
-    const key = petKey(), b = SPR[key], tomb = SPR.tomb;
-    S.shadow(W - tomb.w - 3, H, tomb.w);
-    S.art('tomb', W - tomb.w - 3, H - tomb.h);
-    const bob = Math.round(Math.sin(t / 400) * 1.5);
-    const y = H - b.h - 6 + bob;
-    S.art(key, 4, y, { alpha: 0.8 });
-    S.art('halo', 4 + Math.floor(b.w / 2) - 3, y - 4);
-    if (blink(t, 600)) S.label('NEW EGG?', -8);
-    zone(-4, -12, W + 8, H + 12, () => { ui.mode = 'deadConfirm'; }, { x: 12, y: -10, w: 24, h: 9 });
+    const key = petKey(), b = sz(key), tb = sz('tomb');
+    const tx = W - tb.w - 10;
+    S.shadow(tx, FOOT + 1, tb.w); S.art('tomb', tx, FOOT - tb.h + 1);
+    const bob = Math.round(Math.sin(t / 500) * 1.5);
+    S.art(key, 10, FOOT - b.h - 8 + bob, { alpha: 0.45, frame: S.frame });
+    if (t % 2400 < 1800) S.label('Rest in peace. Tap for a new egg.', -24, UI.dim);
+    zone(-20, -40, W + 40, H + 40, () => { ui.mode = 'deadConfirm'; }, { x: 0, y: -27, w: W, h: 13 }, 'dead');
   }
   function drawDeadConfirm() {
-    drawDead(0);
-    ui.zones = [];
-    S.overlay('rgba(20, 10, 30, 0.35)');
-    S.panel(6, -6, 36, 28);
-    S.textC('NEW EGG?', -2);
-    button(13, 8, 22, 10, 'YES', ui.lastInput === 'key');
-    zone(-4, 4, W + 8, H, newEgg, { x: 13, y: 8, w: 22, h: 10 });
+    drawDead(0); ui.zones = []; dim();
+    S.panel(14, -10, 68, 44);
+    S.textC('Hatch a new egg?', -3);
+    S.button(28, 12, 40, 15, 'YES', ui.lastInput === 'key');
+    zone(-20, 6, W + 40, H + 30, newEgg, { x: 28, y: 12, w: 40, h: 15 }, 'yes');
   }
 
   // ---------------------------------------------------------------- menus / status
   const FEED_OPTS = () => [
-    { label: 'MEAL', icon: 'meal', fn: () => feed(false) },
-    { label: 'SNACK', icon: 'snack', fn: () => feed(true) }];
+    { label: 'MEAL', icon: 'meat', fn: () => feed(false) },
+    { label: 'SNACK', icon: 'berry', fn: () => feed(true) }];
   const LIGHT_OPTS = () => [
-    { label: 'ON', icon: null, fn: () => setLights(true) },
-    { label: 'OFF', icon: null, fn: () => setLights(false) }];
+    { label: 'LIGHTS ON', icon: null, fn: () => setLights(true) },
+    { label: 'LIGHTS OFF', icon: null, fn: () => setLights(false) }];
   const BATTLE_OPTS = () => [
-    { label: 'RANDOM', icon: null, fn: startSearch },
-    { label: 'FRIEND', icon: null, fn: openLinkPanel },
-    { label: 'COMPUTER', icon: null, fn: () => { back(); startLocalBattle(T.Battle.cpuCard(state.stage), 'cpu'); } }];
+    { label: 'RANDOM ONLINE', icon: null, fn: startSearch },
+    { label: 'FRIEND CODE', icon: null, fn: openLinkPanel },
+    { label: 'VS COMPUTER', icon: null, fn: () => { back(); startLocalBattle(T.Battle.cpuCard(state.stage), 'cpu'); } }];
 
-  function feed(snack) { back(); eatAnim(snack ? 'snack' : 'meal', snack ? Pet.feedSnack(state) : Pet.feedMeal(state)); }
+  function feed(snack) { back(); eatAnim(snack ? 'berry' : 'meat', snack ? Pet.feedSnack(state) : Pet.feedMeal(state)); }
   function setLights(on) { Pet.setLights(state, on); A.sfx('ok'); back(); }
 
+  function pips(x, y, n, max, col) {
+    for (let i = 0; i < max; i++) { S.rect(x + i * 14, y, 12, 6, UI.edge); S.rect(x + i * 14 + 1, y + 1, 10, 4, i < n ? col : '#343b48'); }
+  }
   function drawStatus(t) {
-    const s = state, f = T.FORMS[s.formId];
-    drawMain(t, true);
-    S.overlay('rgba(20, 10, 30, 0.25)');
-    S.panel(2, -10, 44, 35);
+    const s = state, f = T.FORMS[s.formId], card = T.Battle.card(s);
+    drawMain(t, true); dim();
+    const x = 4, y = -44, w = 88, h = 92;
+    S.panel(x, y, w, h);
+    const titles = ['PROFILE', 'HUNGER', 'MOOD', 'DISCIPLINE', 'RECORD'];
+    S.text(titles[ui.page], x + 7, y + 6, UI.accent);
+    S.text((ui.page + 1) + '/' + STATUS_PAGES, x + w - 7 - S.textW('5/5'), y + 6, UI.dim);
+    S.rect(x + 5, y + 15, w - 10, 1, UI.inner);
+    const cx = x + 7, cy = y + 22;
     switch (ui.page) {
-      case 0:
-        S.textC(s.name, -6); S.textC(f.name, 3, '#9c1465');
-        S.textC(Math.floor(s.ageMs / C.T.DAY) + 'Y ' + s.weight + 'G', 11); break;
-      case 1: S.textC('HUNGRY', -6); drawHearts(s.hunger, 4); break;
-      case 2: S.textC('HAPPY', -6); drawHearts(s.happy, 4); break;
+      case 0: {
+        const k = petKey(), a = sz(k);
+        S.art(k, x + w - a.w - 8, y + h - a.h - 14, { frame: S.frame });
+        S.text(s.name, cx, cy, UI.text);
+        S.text(f.name, cx, cy + 10, UI.accent);
+        S.text('Lv ' + T.Battle.level(card), cx, cy + 20, UI.text);
+        S.text('Age ' + Math.floor(s.ageMs / C.T.DAY), cx, cy + 30, UI.dim);
+        S.text('Wt ' + s.weight, cx, cy + 40, UI.dim);
+        break;
+      }
+      case 1: S.text('Fullness', cx, cy, UI.dim); pips(cx, cy + 12, s.hunger, 4, UI.accent); S.text(s.hunger ? (s.hunger >= 3 ? 'Well fed.' : 'Could eat.') : 'Starving!', cx, cy + 26, UI.text); break;
+      case 2: S.text('Spirit', cx, cy, UI.dim); pips(cx, cy + 12, s.happy, 4, UI.blue); S.text(s.happy ? (s.happy >= 3 ? 'Fired up.' : 'Restless.') : 'Miserable.', cx, cy + 26, UI.text); break;
       case 3: {
-        S.textC('DISCIPLINE', -6);
-        S.frame(5, 4, 38, 7);
-        const segs = Math.round(s.discipline / 25);
-        for (let i = 0; i < segs; i++) S.rect(7 + i * 9, 6, 7, 3, '#5ec85e');
-        S.textC(s.discipline + '%', 13);
+        S.text('Obedience', cx, cy, UI.dim);
+        S.rect(cx, cy + 12, 72, 7, UI.edge); S.rect(cx + 1, cy + 13, 70, 5, '#343b48');
+        S.rect(cx + 1, cy + 13, Math.round(70 * s.discipline / 100), 5, UI.green);
+        S.text(s.discipline + '%', cx, cy + 26, UI.text);
         break;
       }
       case 4:
-        S.textC('BATTLE', -6); S.textC('W' + s.wins + ' L' + (s.battles - s.wins), 3);
-        S.textC('TRAIN ' + s.training, 11); break;
+        S.text('Wins ' + s.wins + '  Losses ' + (s.battles - s.wins), cx, cy, UI.text);
+        S.text('Training ' + s.training, cx, cy + 12, UI.text);
+        if (f.special) S.text('Special: ' + f.special.name, cx, cy + 24, UI.dim);
+        if (f.move) S.text('Move: ' + f.move, cx, cy + 34, UI.dim);
+        break;
     }
-    for (let i = 0; i < STATUS_PAGES; i++) { if (i === ui.page) S.rect(15 + i * 4, 19, 2, 2); else S.rect(15 + i * 4, 20, 1, 1, '#b09a80'); }
-    if (blink(t, 500)) S.text('>', 40, 18, '#9c1465');
-    zone(-4, -12, W + 8, H + 12, nextStatusPage, { x: 39, y: 17, w: 5, h: 7 });
+    for (let i = 0; i < STATUS_PAGES; i++) S.rect(x + w / 2 - 12 + i * 6, y + h - 8, 3, 3, i === ui.page ? UI.accent : '#4a5366');
+    if (blink(t, 500)) S.text('>', x + w - 10, y + h - 11, UI.accent);
+    zone(-20, -60, W + 40, H + 80, nextStatusPage, { x: x + w - 14, y: y + h - 14, w: 10, h: 10 }, 'status');
   }
   function nextStatusPage() { ui.page++; if (ui.page >= STATUS_PAGES) back(); }
 
   // ---------------------------------------------------------------- care animations
   function eatAnim(food, result) {
-    const key = petKey(), b = SPR[key], fb = SPR[food];
+    const key = petKey(), b = sz(key), fb = sz(food);
     if (result === 'refuse') return refuseAnim(food);
     A.sfx('eat');
     startAnim(2400, (t, pr) => {
       const bite = Math.min(3, Math.floor(pr * 4));
-      const px = 8, fx = px + b.w + 2, fy = H - fb.h - 1;
-      if (bite < 3) S.art(food, fx, fy, { clipX: bite * 2 + (bite ? 1 : 0) });
-      drawPet(key, px, groundY(b) - (blink(t, 300) ? 0 : 1), false);
+      const px = Math.floor(W / 2) - 4, fx = px - fb.w - 1, fy = FOOT - fb.h + 1;
+      if (bite < 3) S.art(food, fx, fy, { clipX: 0, frame: 0, alpha: 1 - bite * 0.25 });
+      drawPet(key, px, groundY(key) + (blink(t, 300) ? 0 : 1), false);
       if (Math.floor(t / 600) !== Math.floor((t - 100) / 600)) A.sfx('eat');
     }, () => { if (result === 'sick') { ui.emote = 'skull'; ui.emoteUntil = now() + 2500; } });
   }
   function refuseAnim(prop) {
     A.sfx('no');
-    const key = petKey(), b = SPR[key];
+    const key = petKey(), b = sz(key);
     startAnim(1600, (t) => {
-      const x = Math.floor((W - b.w) / 2) - 6;
-      drawPet(key, x, groundY(b), blink(t, 200));
-      if (prop) S.art(prop, W - SPR[prop].w - 3, H - SPR[prop].h - 1);
-      drawEmote('angry', x, groundY(b), b.w);
+      const x = Math.floor((W - b.w) / 2);
+      drawPet(key, x + (blink(t, 120) ? 1 : -1), groundY(key), false);
+      if (prop) { const a = sz(prop); S.art(prop, 4, FOOT - a.h + 1); }
+      drawEmote('angry', x, groundY(key), b.w);
     });
   }
   function happyAnim(emote, ms) {
     A.sfx('happy');
-    const key = petKey(), b = SPR[key];
+    const key = petKey(), b = sz(key);
     startAnim(ms || 1500, (t) => {
       const x = Math.floor((W - b.w) / 2);
-      drawPet(key, x, groundY(b) - (blink(t, 250) ? 2 : 0), false);
-      if (emote) drawEmote(emote, x, groundY(b), b.w);
+      drawPet(key, x, groundY(key) - (blink(t, 250) ? 2 : 0), false);
+      if (emote) drawEmote(emote, x, groundY(key), b.w);
     });
   }
   function cleanAnim() {
-    const key = petKey(), b = SPR[key], had = state.poops.length, oldPoops = state.poops.slice();
+    const key = petKey(), had = state.poops.length, oldPoops = state.poops.slice();
     Pet.clean(state);
     A.sfx('ok');
     startAnim(1500, (t, pr) => {
-      const wx = Math.floor(pr * (W + 8)) - 4;
-      oldPoops.forEach((p, i) => { if (POOP_SLOTS[i][0] > wx) S.art('poop', POOP_SLOTS[i][0], POOP_SLOTS[i][1]); });
-      drawPet(key, ui.pet.x, groundY(b), false);
-      for (let y = -2; y < H; y++) {
+      const wx = Math.floor(pr * (W + 16)) - 8;
+      oldPoops.forEach((p, i) => { const [x, y] = poopSlot(i); if (i < 4 && x < wx) S.art('dung', x, y); });
+      drawPet(key, ui.pet.x, groundY(key), false);
+      for (let y = FOOT - 14; y <= FOOT; y++) {
         const o = (y >> 1) % 2;
-        S.rect(wx + o, y, 2, 1, WATER); S.rect(wx - 2 + o, y, 2, 1, 'rgba(94,200,255,0.45)');
-        if (y % 5 === 0) S.rect(wx + 2 + o, y, 1, 1, '#ffffff');
+        S.rect(W - wx - o, y, 2, 1, 'rgba(190,210,225,0.8)'); S.rect(W - wx + 2 - o, y, 3, 1, 'rgba(190,210,225,0.3)');
       }
     }, () => { if (had) happyAnim('note', 1200); });
   }
   function medicineAnim(result) {
-    if (result === 'refuse') return refuseAnim('syringe');
+    if (result === 'refuse') return refuseAnim('potion');
     A.sfx('ok');
-    const key = petKey(), b = SPR[key], sy = SPR.syringe;
+    const key = petKey(), b = sz(key), pb = sz('potion');
     startAnim(1700, (t, pr) => {
-      const px = 4; drawPet(key, px, groundY(b), false);
-      const sx = Math.round(W - sy.w - pr * (W - sy.w - px - b.w - 1));
-      if (pr < 0.85) S.art('syringe', sx, H - 9, { flip: true });
+      const px = Math.floor((W - b.w) / 2); drawPet(key, px, groundY(key), false);
+      if (pr < 0.7) S.art('potion', px + b.w / 2 - pb.w / 2, groundY(key) - pb.h - 4 + pr * 10, { alpha: 1 - pr });
+      else drawSparkles(t, px + b.w / 2, groundY(key) + b.h / 2);
     }, () => {
       if (result === 'cured') happyAnim('heart', 1400);
       else { ui.emote = 'sweat'; ui.emoteUntil = now() + 2000; }
     });
   }
   function scoldAnim(result) {
-    const key = petKey(), b = SPR[key];
+    const key = petKey(), b = sz(key);
     A.sfx(result === 'ok' ? 'ok' : 'no');
     startAnim(1700, (t, pr) => {
-      const x = Math.floor((W - b.w) / 2) + 4;
-      drawPet(key, x, groundY(b), false);
-      if (blink(t, 200)) { S.panel(1, 0, 7, 20); S.rect(3, 2, 3, 11, RED); S.rect(3, 15, 3, 3, RED); }
-      if (pr > 0.5) drawEmote(result === 'ok' ? 'sweat' : 'angry', x, groundY(b), b.w);
+      const x = Math.floor((W - b.w) / 2) + 8;
+      drawPet(key, x, groundY(key), false);
+      if (blink(t, 200)) S.label('!', 10, UI.red, 14);
+      if (pr > 0.5) drawEmote(result === 'ok' ? 'sweat' : 'angry', x, groundY(key), b.w);
     });
   }
   function noticeAnim(line1, line2, ms, onEnd) {
     startAnim(ms || 2000, (t) => {
       drawMain(t, true);
-      if (t > 250 || blink(t, 80)) S.label(line1, -6);
-      if (line2 && t > 500) S.label(line2, 6, '#9c1465');
+      const L = battleLayout();
+      S.panel(0, L.tb, W, 38);
+      if (t > 150) S.wrap(line1, W - 12).slice(0, 1).forEach((ln) => S.text(ln, 6, L.tb + 6, UI.accent));
+      if (line2 && t > 500) S.wrap(line2, W - 12).slice(0, 2).forEach((ln, i) => S.text(ln, 6, L.tb + 16 + i * 10, UI.text));
     }, onEnd);
   }
   function hatchAnim() {
     A.sfx('hatch');
     startAnim(2600, (t, pr) => {
-      const e = SPR.egg, ex = Math.floor((W - e.w) / 2), ey = groundY(e), wob = blink(t, 90) ? 1 : -1;
+      const e = sz('egg'), ex = Math.floor((W - e.w) / 2), ey = groundY('egg'), wob = blink(t, 90) ? 1 : -1;
       if (pr < 0.65) {
         drawPet('egg', ex + wob, ey, false);
-        if (pr > 0.35) for (let i = 1; i < e.w - 1; i++) S.rect(ex + i + wob, ey + 6 + (i % 2), 1, 1);
+        if (pr > 0.35) for (let i = 2; i < e.w - 2; i++) S.rect(ex + i + wob, ey + 9 + (i % 2), 1, 1, T.Monsters.GLOW.cyan);
       } else if (pr < 0.75) {
-        S.overlay('rgba(255,255,255,0.9)');
+        S.overlay('rgba(230,240,255,0.85)');
       } else {
-        const key = petKey(), b = SPR[key], x = Math.floor((W - b.w) / 2);
-        drawPet(key, x, groundY(b) - (blink(t, 200) ? 2 : 0), false);
-        drawSparkles(t, x + b.w / 2, groundY(b) + 2);
+        const key = petKey(), b = sz(key), x = Math.floor((W - b.w) / 2);
+        drawPet(key, x, groundY(key), false);
+        drawSparkles(t, x + b.w / 2, groundY(key) + b.h / 2);
       }
     });
   }
   function evolveAnim(from, to) {
-    startAnim(3600, (t, pr) => {
-      const ob = petSpr(from), nb = petSpr(to), fk = petKey(from), tk = petKey(to);
+    startAnim(3800, (t, pr) => {
+      const fk = petKey(from), tk = petKey(to), ob = sz(fk), nb = sz(tk);
       const cx = (b) => Math.floor((W - b.w) / 2);
+      dim();
       if (pr < 0.62) {
         const period = 320 - 270 * (pr / 0.62);
-        if (Math.floor(t / period) % 2) { S.overlay('rgba(255,255,255,0.85)'); S.art(tk, cx(nb), groundY(nb), { silhouette: INK }); }
-        else drawPet(fk, cx(ob), groundY(ob), false);
+        if (Math.floor(t / period) % 2) S.art(tk, cx(nb), groundY(tk), { silhouette: '#e8eef8' });
+        else S.art(fk, cx(ob), groundY(fk), { silhouette: '#e8eef8' });
+        if (t < 1400) S.label('What? ' + formName(from) + ' is evolving!', -24, UI.text);
       } else if (pr < 0.7) {
-        S.overlay(blink(t, 60) ? 'rgba(255,255,255,0.95)' : 'rgba(255,240,150,0.6)');
+        S.overlay(blink(t, 60) ? 'rgba(240,244,255,0.95)' : 'rgba(240,244,255,0.5)');
       } else {
-        drawPet(tk, cx(nb), groundY(nb) - (blink(t, 250) ? 1 : 0), false);
-        drawSparkles(t, W / 2, groundY(nb) + nb.h / 2);
-        S.label(T.FORMS[to].name, -8, '#9c1465');
+        drawPet(tk, cx(nb), groundY(tk), false);
+        drawSparkles(t, W / 2, groundY(tk) + nb.h / 2);
+        S.label(formName(from) + ' became ' + T.FORMS[to].name + '!', -24, UI.accent);
       }
     }, null, () => A.sfx('evolve'));
   }
 
-  // ---------------------------------------------------------------- play mini-game (left / right)
+  // ---------------------------------------------------------------- training mini-game (left / right)
   function startPlay() {
     ui.mode = 'play';
     ui.play = { round: 1, score: 0, phase: 'wait', t0: now(), guess: null, dir: null };
@@ -354,37 +360,39 @@
     A.sfx(P.hit ? 'ok' : 'no');
   }
   function drawPlay(t) {
-    const P = ui.play, key = petKey(), b = SPR[key], cx = Math.floor((W - b.w) / 2);
-    S.label(P.round + '/5  HIT ' + P.score, -8);
+    const P = ui.play, key = petKey(), b = sz(key), cx = Math.floor((W - b.w) / 2);
+    S.label('TRAINING  ' + P.round + '/5   HITS ' + P.score, -26, UI.text);
     if (P.phase === 'wait') {
-      drawPet(key, cx, groundY(b), false);
-      button(0, 9, 9, 11, '<', ui.lastInput === 'key' && blink(t, 500));
-      button(W - 9, 9, 9, 11, '>', ui.lastInput === 'key' && !blink(t, 500));
-      S.glyph('e_question', cx + b.w + 1 > 38 ? cx - 6 : cx + b.w + 1, groundY(b) - 2);
-      zone(-8, -12, W / 2 + 8, H + 12, () => playGuess(-1), { x: 0, y: 9, w: 9, h: 11 });
-      zone(W / 2, -12, W / 2 + 8, H + 12, () => playGuess(1), { x: W - 9, y: 9, w: 9, h: 11 });
+      drawPet(key, cx, groundY(key), false);
+      const hl = ui.lastInput === 'key' && blink(t, 500);
+      S.button(0, 8, 16, 24, '<', hl); S.button(W - 16, 8, 16, 24, '>', ui.lastInput === 'key' && !hl);
+      S.textC('Which way will it dodge?', -10, UI.dim);
+      zone(-20, -40, W / 2 + 20, H + 60, () => playGuess(-1), { x: 0, y: 8, w: 16, h: 24 }, 'left');
+      zone(W / 2, -40, W / 2 + 20, H + 60, () => playGuess(1), { x: W - 16, y: 8, w: 16, h: 24 }, 'right');
     } else if (P.phase === 'reveal') {
-      const el = t - P.t0, x = cx + P.dir * 7;
-      drawPet(key, x, groundY(b) - (P.hit && blink(t, 200) ? 2 : 0), P.dir < 0);
-      if (el > 300) drawEmote(P.hit ? 'heart' : 'sweat', x, groundY(b), b.w);
+      const el = t - P.t0, x = cx + P.dir * 16;
+      drawPet(key, x, groundY(key) - (P.hit && blink(t, 200) ? 2 : 0), P.dir > 0);
+      if (el > 300) drawEmote(P.hit ? 'heart' : 'sweat', x, groundY(key), b.w);
       if (el > 1300) {
         if (P.round >= 5) { P.phase = 'done'; P.t0 = t; const r = Pet.playDone(state, P.score); A.sfx(r === 'win' ? 'win' : 'lose'); P.result = r; }
         else { P.round++; P.phase = 'wait'; }
       }
     } else {
-      drawPet(key, cx, groundY(b) - (P.result === 'win' && blink(t, 200) ? 2 : 0), false);
-      S.label(P.result === 'win' ? 'WIN!' : 'LOSE', 0, P.result === 'win' ? '#1d8a3a' : RED);
+      drawPet(key, cx, groundY(key) - (P.result === 'win' && blink(t, 200) ? 2 : 0), false);
+      S.label(P.result === 'win' ? 'Good session!' : 'Sloppy today...', -10, P.result === 'win' ? UI.green : UI.red);
       if (t - P.t0 > 1800) { ui.play = null; back(); }
     }
   }
 
-  // ---------------------------------------------------------------- battles
+  // ---------------------------------------------------------------- battles (Gen-3 style layout)
   /* ui.battle = { kind:'cpu'|'friend'|'online', me, opp (display: {card,hp,max}), phase, queue, driver, role, cur }
    * phase: found -> intro -> idle/choose/wait/anim ... -> end. The driver pushes events into B.queue:
    *   {type:'turn', role:'atk'|'def'}  {type:'result', attacker:'me'|'opp', res, hp:{me,opp}}  {type:'end', won, reason}
    * Local battles (CPU / friend code) use localDriver; online battles are driven by server messages. */
+  const ANIM_MS = 1900;
   function newBattle(kind, meView, oppView, driver) {
-    const B = { kind, me: meView, opp: oppView, phase: kind === 'online' ? 'found' : 'intro', t0: now(), queue: [], driver, role: null, cur: null };
+    const B = { kind, me: meView, opp: oppView, phase: kind === 'online' ? 'found' : 'intro', t0: now(), queue: [], driver, role: null, cur: null,
+                shownHp: { me: meView.hp, opp: oppView.hp } };
     ui.battle = B; ui.mode = 'battle'; ui.sel = 7;
     A.sfx('ok');
     return B;
@@ -430,83 +438,120 @@
   }
   function battleStep(t) {
     const B = ui.battle;
-    if (B.phase === 'found' && t - B.t0 > 1100) { B.phase = 'intro'; B.t0 = t; }
-    if (B.phase === 'intro' && t - B.t0 > 1600) { B.phase = 'idle'; B.t0 = t; }
-    if (B.phase === 'anim' && t - B.t0 > 1400) { B.me.hp = B.cur.hp.me; B.opp.hp = B.cur.hp.opp; B.phase = 'idle'; B.t0 = t; }
+    if (B.phase === 'found' && t - B.t0 > 1300) { B.phase = 'intro'; B.t0 = t; }
+    if (B.phase === 'intro' && t - B.t0 > 1800) { B.phase = 'idle'; B.t0 = t; }
+    if (B.phase === 'anim' && t - B.t0 > ANIM_MS) { B.me.hp = B.cur.hp.me; B.opp.hp = B.cur.hp.opp; B.phase = 'idle'; B.t0 = t; }
     if ((B.phase === 'idle' || B.phase === 'wait') && B.queue.length) {
       const e = B.queue.shift();
       if (e.type === 'turn') { B.phase = 'choose'; B.role = e.role; B.t0 = t; }
-      else if (e.type === 'result') { B.phase = 'anim'; B.cur = e; B.t0 = t; A.sfx('shoot'); }
+      else if (e.type === 'result') { B.phase = 'anim'; B.cur = e; B.t0 = t; B.from = { me: B.me.hp, opp: B.opp.hp }; A.sfx('shoot'); }
       else if (e.type === 'end') finishBattle(B, e.won, e.reason);
     }
-    if (B.phase === 'end' && t - B.t0 > 2600) { ui.battle = null; back(); }
+    if (B.phase === 'end' && t - B.t0 > 3000) { ui.battle = null; back(); }
   }
-  function drawHP(f, right, name) {
-    const w = f.max * 2 + 3, x = right ? W - w : 0;
-    S.panel(x, -2, w, 7);
-    for (let i = 0; i < f.max; i++) {
-      const px = right ? x + w - 3 - i * 2 : x + 2 + i * 2;
-      S.rect(px, 0, 1, 3, i < f.hp ? '#ff4d6d' : '#c9b8a8');
-    }
-    const nm = String(name).slice(0, 6);
-    S.text(nm, right ? W - S.textW(nm) - 1 : 1, -9);
+  function battleLayout() {
+    const b = S.bounds(), top = b.top, tb = b.bottom - 40;
+    return { top, tb, pcx: 21, pcy: tb - 6, ocx: 70, ocy: top + Math.max(52, Math.min(70, Math.round((tb - top) * 0.5))) };
   }
+  function plate(x, y, w, f, hp, nums) {
+    S.panel(x, y, w, 30);
+    const name = formName(f.card.formId), lv = 'Lv' + T.Battle.level(f.card);
+    S.text(name, x + 5, y + 4, UI.text);
+    S.hpBar(x + 5, y + 13, w - 10, hp, f.max);
+    S.text(lv, x + 5, y + 21, UI.dim);
+    if (nums) { const n = Math.ceil(hp * 10) + '/' + f.max * 10; S.text(n, x + w - 5 - S.textW(n), y + 21, UI.text); }
+  }
+  function textBox(L, lines, color) {
+    S.panel(0, L.tb, W, 38);
+    lines.slice(0, 3).forEach((ln, i) => S.text(ln, 6, L.tb + 6 + i * 10, color || UI.text));
+  }
+  function msgLines(s) { return S.wrap(s, W - 12); }
+
   function drawBattle(t) {
     battleStep(t);
     const B = ui.battle;
     if (!B) return drawMain(t);
-    const mk = petKey(B.me.card.formId), ok = petKey(B.opp.card.formId), mb = SPR[mk], ob = SPR[ok];
-    const el = t - B.t0, ox = W - ob.w;
-    let meVis = true, oppVis = true, myY = groundY(mb), opY = groundY(ob), showHP = true, overlayUI = null;
+    const L = battleLayout(), el = t - B.t0;
+    const mk = petKey(B.me.card.formId), ok = petKey(B.opp.card.formId), mb = sz(mk), ob = sz(ok);
+    const myName = formName(B.me.card.formId), opName = formName(B.opp.card.formId), foe = 'Foe ' + opName;
+    let myX = L.pcx - Math.floor(mb.w / 2), myY = L.pcy - mb.h + 2, opX = L.ocx - Math.floor(ob.w / 2), opY = L.ocy - ob.h + 2;
+    let meVis = true, oppVis = true, meWhite = false, oppWhite = false, shake = 0, fx = null, msg = [], plates = true, meAlpha = 1, oppAlpha = 1;
+    let hpMe = B.me.hp, hpOpp = B.opp.hp;
 
     if (B.phase === 'found') {
-      showHP = false; meVis = false; oppVis = false;
-      overlayUI = () => { if (blink(t, 180)) S.label('FOUND!', -2, '#1d8a3a'); S.label(B.opp.card.name, 9); };
+      plates = false; meVis = false;
+      oppAlpha = Math.min(1, el / 900); oppWhite = el < 400;
+      msg = msgLines('Rival found! ' + B.opp.card.name + ' wants to battle!');
     } else if (B.phase === 'intro') {
-      showHP = false;
-      overlayUI = () => { S.label(B.kind === 'online' ? 'LIVE VS' : 'VS', 6, RED); S.label(B.opp.card.name.slice(0, 8), -8); };
+      const k = Math.max(0, 1 - el / 700);
+      opX += Math.round(k * 60); myX -= Math.round(k * 60);
+      plates = el > 700;
+      msg = msgLines(B.kind === 'cpu' ? 'A wild ' + opName + ' appeared!' : B.opp.card.name + ' sent out ' + opName + '!');
+      if (el > 1000) msg = msgLines('Go, ' + myName + '!');
+    } else if (B.phase === 'choose' && B.role === 'def' && el < 700) {
+      msg = msgLines(foe + ' is about to attack!');
     } else if (B.phase === 'choose') {
-      overlayUI = () => {
-        S.label(B.role === 'atk' ? 'ATTACK!' : 'GUARD!', -18, B.role === 'atk' ? RED : '#1d6ad8');
-        const hl = ui.lastInput === 'key' && blink(t, 500);
-        S.panel(16, 3, 16, 9, hl ? S.HILITE : null); S.text('HI', 19, 5); S.glyph('up3', 27, 6);
-        S.panel(16, 14, 16, 9, hl ? S.HILITE : null); S.text('LO', 19, 16); S.glyph('down3', 27, 17);
-      };
-      zone(-8, -24, W + 16, 24 + 13, () => battleMove('hi'), { x: 16, y: 3, w: 16, h: 9 });
-      zone(-8, 13, W + 16, 24, () => battleMove('lo'), { x: 16, y: 14, w: 16, h: 9 });
+      const atk = B.role === 'atk', hl = ui.lastInput === 'key' && blink(t, 500);
+      msg = null;
+      S.panel(0, L.tb, W, 38);
+      S.text(atk ? 'Strike HIGH or LOW?' : 'Guard HIGH or LOW?', 6, L.tb + 5, atk ? UI.text : UI.accent);
+      const by = L.tb + 16, bh = 18, bw = 43;
+      S.panel(3, by, bw, bh, hl ? UI.accent : null); S.panel(W - 3 - bw, by, bw, bh, hl ? UI.accent : null);
+      const l1 = 'HIGH', l2 = 'LOW';
+      S.text(l1, 3 + 8, by + 6); S.glyph('up3', 3 + bw - 11, by + 8, UI.accent);
+      S.text(l2, W - 3 - bw + 8, by + 6); S.glyph('down3', W - 3 - 11, by + 8, UI.accent);
+      zone(-20, L.tb + 12, W / 2 + 20, 60, () => battleMove('hi'), { x: 3, y: by, w: bw, h: bh }, 'hi');
+      zone(W / 2, L.tb + 12, W / 2 + 20, 60, () => battleMove('lo'), { x: W - 3 - bw, y: by, w: bw, h: bh }, 'lo');
     } else if (B.phase === 'wait' || B.phase === 'idle') {
-      if (B.kind === 'online' && blink(t, 400)) overlayUI = () => S.label('WAIT', 8);
+      msg = msgLines(B.kind === 'online' ? 'Waiting for ' + B.opp.card.name + '...' : '...');
     } else if (B.phase === 'anim') {
-      const r = B.cur.res, mine = B.cur.attacker === 'me';
-      const y = r.dir === 'hi' ? 9 : 17;
-      const x0 = mine ? mb.w + 1 : ox - 4, x1 = mine ? ox - 4 : mb.w + 1;
-      const pr = Math.min(1, el / 650);
-      overlayUI = () => {
-        if (r.special && blink(t, 150)) S.label(r.special + '!', -18, RED);
-        if (r.stunned) S.label('STUNNED', -18);
-        else if (pr < 1) S.art('fireball', Math.round(x0 + (x1 - x0) * pr), y);
-        else {
-          const defX = mine ? ox - 3 : mb.w + 1;
-          if (r.blocked || r.absorbed) { for (let j = -3; j <= 3; j++) S.rect(defX + (mine ? 1 : 0), y + 1 + j, 1, 1, '#9fe0ff'); S.label('BLOCK', -8, '#1d6ad8'); }
-          else if (r.dodged) S.label('MISS', -8);
-          else if (r.hit) S.label('-' + r.dmg, -8, RED);
+      const r = B.cur.res, mine = B.cur.attacker === 'me', atkName = mine ? myName : foe, defName = mine ? foe : myName;
+      const move = r.special || (T.FORMS[(mine ? B.me : B.opp).card.formId] || {}).move || 'TACKLE';
+      // HP drains between 450ms and 1000ms
+      const k = U.clamp((el - 450) / 550, 0, 1);
+      hpMe = B.from.me + (B.cur.hp.me - B.from.me) * k; hpOpp = B.from.opp + (B.cur.hp.opp - B.from.opp) * k;
+      if (r.stunned) msg = msgLines(atkName + ' is stunned and can\'t move!');
+      else {
+        const lunge = el < 350 ? Math.round(Math.sin(el / 350 * Math.PI) * 7) : 0;
+        if (mine) { myX += lunge; myY -= Math.round(lunge / 3); } else { opX -= lunge; opY += Math.round(lunge / 3); }
+        msg = msgLines(atkName + ' used ' + move + '!');
+        if (el > 380 && el < 1000) {
+          const tx = mine ? opX : myX, ty = mine ? opY : myY, tw = mine ? ob.w : mb.w, th = mine ? ob.h : mb.h;
+          const fy = ty + (r.dir === 'hi' ? Math.round(th * 0.3) : Math.round(th * 0.72));
+          if (r.hit) {
+            if (Math.floor(el / 70) % 2) { if (mine) oppWhite = true; else meWhite = true; }
+            shake = (Math.floor(el / 40) % 2 ? 1 : -1) * (r.dmg > 1 ? 2 : 1);
+            fx = { type: 'slash', x: tx + Math.floor(tw / 2), y: fy };
+          } else if (r.blocked || r.absorbed) fx = { type: 'block', x: tx + (mine ? -2 : tw + 1), y: fy };
+          else if (r.dodged) { if (mine) opX += 8; else myX -= 8; }
         }
-      };
-      if (pr >= 1) {
-        if (!B.cur.applied) { B.cur.applied = true; B.me.hp = B.cur.hp.me; B.opp.hp = B.cur.hp.opp; A.sfx(r.hit ? 'hit' : 'block'); }
-        if (r.hit && blink(t, 90)) { if (mine) oppVis = false; else meVis = false; }
-        else if (r.dodged) { if (mine) opY -= 4; else myY -= 4; }
+        if (el > 1000) {
+          const out = r.hit ? (r.dmg > 1 ? 'A crushing blow!' : 'It hit ' + defName + '!') :
+            r.blocked ? defName + ' blocked it!' : r.dodged ? defName + ' dodged the attack!' : r.absorbed ? defName + ' absorbed the blow!' :
+            r.heal ? '' : 'Nothing happened.';
+          msg = msgLines([out, r.heal ? atkName + ' recovered HP!' : ''].filter(Boolean).join(' '));
+        }
       }
     } else if (B.phase === 'end') {
-      showHP = false;
-      if (B.won) myY -= blink(t, 200) ? 2 : 0; else if (B.reason !== 'lost') opY -= blink(t, 200) ? 2 : 0;
-      overlayUI = () => S.label(B.reason === 'lost' ? 'LINK LOST' : B.won ? 'WIN!' : 'LOSE', -8, B.won ? '#1d8a3a' : RED);
+      const k = U.clamp(el / 600, 0, 1);
+      if (B.reason !== 'lost') { if (B.won) { oppAlpha = 1 - k; opY += Math.round(k * 10); } else if (B.reason !== 'fled') { meAlpha = 1 - k; myY += Math.round(k * 10); } }
+      msg = msgLines(B.reason === 'lost' ? 'The link was lost.' : B.reason === 'fled' && !B.won ? 'Got away safely!' :
+        B.won ? (B.reason === 'ko' ? foe + ' fainted! You win!' : 'The rival fled. You win!') : myName + ' fainted... You lost.');
     }
-    if (showHP) { drawHP(B.me, false, B.me.card.name); drawHP(B.opp, true, B.opp.card.name); }
-    S.shadow(0, H, mb.w); S.shadow(ox, H, ob.w);
-    if (meVis) S.art(mk, 0, myY, { flip: false });
-    if (oppVis) S.art(ok, ox, opY, { flip: true });
-    if (overlayUI) overlayUI();
+
+    // platforms + monsters (+ shake)
+    S.ctx.save(); S.ctx.translate(shake, 0);
+    S.platform(L.ocx, L.ocy, 26, 6); S.platform(L.pcx, L.pcy, 28, 7);
+    if (oppVis) S.art(ok, opX, opY, { frame: S.frame, alpha: oppAlpha, silhouette: oppWhite ? '#f4f6ff' : null });
+    if (meVis) S.art(mk, myX, myY, { flip: true, frame: S.frame, alpha: meAlpha, silhouette: meWhite ? '#f4f6ff' : null });
+    if (fx && fx.type === 'slash') for (let i = -1; i <= 1; i++) for (let j = -4; j <= 4; j++) S.rect(fx.x + j + i * 3, fx.y + j, 1, 1, i === 0 ? '#ffffff' : 'rgba(255,240,200,0.8)');
+    if (fx && fx.type === 'block') for (let j = -5; j <= 5; j++) S.rect(fx.x + Math.round(Math.abs(j) / 3), fx.y + j, 1, 1, '#9fd4ff');
+    S.ctx.restore();
+    if (plates) {
+      plate(2, L.top + 3, 54, B.opp, hpOpp, false);
+      plate(W - 57, L.tb - 34, 56, B.me, hpMe, true);
+    }
+    if (msg) textBox(L, msg);
   }
 
   // ---------------------------------------------------------------- online: search -> match or fall back
@@ -537,9 +582,9 @@
         if (ui.search !== Q) return;
         ui.search = null; ui.fallbackReason = why;
         back();
-        const msg = why === 'nomatch' ? 'NO RIVAL' : why.startsWith('rejected') ? 'REJECTED' : 'OFFLINE';
+        const msg = why === 'nomatch' ? 'No rival found.' : why.startsWith('rejected') ? 'The server refused.' : 'Server offline.';
         A.sfx('no');
-        noticeAnim(msg, 'VS CPU', 2200, () => startLocalBattle(T.Battle.cpuCard(state.stage), 'cpu'));
+        noticeAnim(msg, 'A wild monster appeared!', 2200, () => startLocalBattle(T.Battle.cpuCard(state.stage), 'cpu'));
       }
     });
   }
@@ -549,18 +594,19 @@
     ui.search = null; back();
   }
   function drawSearch(t) {
-    const Sx = ui.search, key = petKey(), b = SPR[key], el = t - Sx.t0;
+    const Q = ui.search, key = petKey(), b = sz(key), el = t - Q.t0, L = battleLayout();
+    const x = Math.floor((W - b.w) / 2) - 16;
+    drawPet(key, x, groundY(key), true);
+    const cx = x + b.w + 3, cy = groundY(key) + 8, w = Math.floor(el / 250) % 4;
+    if (w >= 1) S.glyph('wave1', cx, cy - 2, UI.blue);
+    if (w >= 2) S.glyph('wave2', cx + 4, cy - 4, UI.blue);
+    if (w >= 3) S.glyph('wave3', cx + 9, cy - 6, UI.blue);
     const k = Math.floor(el / 400) % 4;
-    S.label('SEARCH' + '.'.repeat(k) + ' '.repeat(3 - k), -8);
-    const py = groundY(b), cy = py + Math.floor(b.h / 2);
-    drawPet(key, 1, py, false);
-    const x0 = b.w + 3, w = Math.floor(el / 250) % 4;
-    if (w >= 1) S.glyph('wave1', x0, cy - 2, '#1d6ad8');
-    if (w >= 2) S.glyph('wave2', x0 + 4, cy - 4, '#1d6ad8');
-    if (w >= 3) S.glyph('wave3', x0 + 9, cy - 6, '#1d6ad8');
-    if (blink(t, 500)) S.glyph('e_question', 40, 8);
+    S.panel(0, L.tb, W, 38);
+    S.text('Finding a rival' + '.'.repeat(k), 6, L.tb + 6);
     const left = U.clamp(1 - el / C.SEARCH_MS, 0, 1);
-    S.panel(31, 18, 16, 6); S.rect(33, 20, Math.round(12 * left), 2, '#5ec85e');
+    S.rect(6, L.tb + 18, W - 12, 5, UI.edge); S.rect(7, L.tb + 19, Math.round((W - 14) * left), 3, UI.blue);
+    S.text('Back to cancel', 6, L.tb + 27, UI.dim);
   }
 
   // ---------------------------------------------------------------- friend code panel (DOM)
@@ -708,8 +754,7 @@
     } else {
       switch (ui.mode) {
         case 'feedMenu': case 'lightMenu': case 'battleMenu':
-          updatePet(t); drawMain(t, true); ui.zones = [];
-          S.overlay('rgba(20, 10, 30, 0.28)');
+          updatePet(t); drawMain(t, true); ui.zones = []; dim();
           drawOptions(ui.mode === 'feedMenu' ? FEED_OPTS() : ui.mode === 'lightMenu' ? LIGHT_OPTS() : BATTLE_OPTS(), TITLES[ui.mode]);
           break;
         case 'status': drawStatus(t); break;
@@ -725,8 +770,7 @@
   function renderHUD() {
     const enabled = canTapIcons();
     ICONS.forEach((n, i) => { hud[n].classList.toggle('on', ui.sel === i && ui.mode !== 'main'); hud[n].disabled = !enabled; });
-    const att = Pet.needsAttention(state);
-    hud.attention.classList.toggle('alert', att);
+    hud.attention.classList.toggle('alert', Pet.needsAttention(state));
     const bk = backAvailable();
     hud.back.disabled = !bk; hud.back.classList.toggle('ready', bk);
     document.body.dataset.mode = ui.mode;
@@ -737,11 +781,11 @@
     const mk = (name, parent, kind) => {
       const el = document.createElement(kind === 'indicator' ? 'div' : 'button');
       el.className = 'pbtn' + (kind === 'indicator' ? ' indicator' : '') + (name === 'back' ? ' back' : '');
-      if (kind !== 'indicator') { el.type = 'button'; el.setAttribute('aria-label', LABELS[name]); }
-      else { el.setAttribute('role', 'status'); el.setAttribute('aria-label', LABELS[name]); }
+      if (kind !== 'indicator') el.type = 'button'; else el.setAttribute('role', 'status');
+      el.setAttribute('aria-label', LABELS[name]);
       el.dataset.icon = name; el.title = LABELS[name];
       const cv = document.createElement('canvas'); cv.className = 'picon';
-      T.Scene.iconCanvas(cv, 'i_' + (name === 'sound' ? 'sound' : name), INK, 3);
+      T.Scene.iconCanvas(cv, 'i_' + name, '#d6deea', 3);
       el.appendChild(cv); parent.appendChild(el);
       hud[name] = el;
       return el;
@@ -787,7 +831,7 @@
     S.c.addEventListener('contextmenu', (e) => e.preventDefault());
     document.getElementById('copyCode').addEventListener('click', () => {
       const txt = document.getElementById('myCode').textContent, btn = document.getElementById('copyCode');
-      const ok = () => { btn.textContent = 'Copied!'; setTimeout(() => (btn.textContent = 'Copy'), 1200); };
+      const ok = () => { btn.textContent = 'Copied'; setTimeout(() => (btn.textContent = 'Copy'), 1200); };
       if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(txt).then(ok, () => selectCode());
       else { selectCode(); try { document.execCommand('copy'); ok(); } catch (e) {} }
     });
@@ -812,7 +856,7 @@
   }
   function updateMute() {
     const m = hud.sound;
-    T.Scene.iconCanvas(m.querySelector('canvas'), A.muted ? 'i_mute' : 'i_sound', INK, 3);
+    T.Scene.iconCanvas(m.querySelector('canvas'), A.muted ? 'i_mute' : 'i_sound', '#d6deea', 3);
     m.classList.toggle('muted', A.muted);
     m.setAttribute('aria-label', A.muted ? 'Sound is off. Turn sound on' : 'Sound is on. Turn sound off');
     m.setAttribute('aria-pressed', String(!A.muted));
@@ -845,6 +889,12 @@
     get scene() { return S; },
     /** Stage coords -> client coords (for tests / tooling). */
     stageToClient(x, y) { return S.toClient(x, y); },
+    /** Client coords of the centre of the tappable zone with this id (null if not on screen). */
+    zonePoint(id) {
+      render();
+      const z = ui.zones.find(q => q.id === id); if (!z) return null;
+      const b = z.box || z; return S.toClient(b.x + b.w / 2, b.y + b.h / 2);
+    },
     resetUI() { ui = freshUI(); },
     newEgg, evolveAnim, startLocalBattle, startSearch, render
   };

@@ -17,6 +17,12 @@
     card(s) {
       return { name: s.name, formId: s.formId, training: s.training, wins: s.wins, battles: s.battles, weight: s.weight };
     },
+    /** Display level (1-99) from stage, training and wins. */
+    level(card) {
+      const f = T.FORMS[card.formId] || {};
+      const base = { baby: 3, child: 9, teen: 17, adult: 28, secret: 42 }[f.stage] || 5;
+      return Math.min(99, base + Math.floor((card.training || 0) / 2) + Math.min(20, card.wins || 0));
+    },
     /** Public view of a fighter (what an opponent / the server sends). */
     view(f) { return { card: f.card, hp: f.hp, max: f.max, st: { hp: f.st.hp, pow: f.st.pow, def: f.st.def, spd: f.st.spd, special: f.st.special } }; },
     statsFor(card) {

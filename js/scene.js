@@ -1,345 +1,362 @@
-/* TAMA-PIX — full-screen pixel-art scene renderer.
+/* TAMA-PIX — full-screen GBA-style scene renderer + dark RPG UI primitives.
  *
- * The whole viewport is one low-res canvas (a few dozen logical pixels wide) scaled up by an integer factor
- * with crisp pixels. Gameplay is laid out on a fixed 48x24 "stage" (STAGE_W x STAGE_H) that sits on the grass
- * in the middle of the screen; everything else is scenery (sky, clouds, hills, meadow, flowers, stars...).
- *
- * Environments: 'day' | 'dusk' (asleep, lights on) | 'night' (lights off) | 'arena' (battles).
- * All drawing helpers below take STAGE coordinates unless the name says otherwise.
+ * The viewport is one low-res canvas scaled up by an integer factor (crisp pixels). Gameplay happens on a
+ * 96x48 "stage" (STAGE_W x STAGE_H) standing on a dirt path in a meadow; negative y reaches into the sky.
+ * Environments: 'day' | 'dusk' (asleep, lights on) | 'night' (lights off) | 'battle'.
+ * Drawing helpers take STAGE coordinates.
  */
 (function (T) {
   'use strict';
-  const C = T.CONFIG;
-  const INK = T.INK;
-  const PAPER = '#fff7e3', PAPER_SHADE = '#e9d6ae', HILITE = '#ffd84a';
-
-  // ------------------------------------------------------------ colourising 1-bit art
-  const artCache = {};
-  function colorize(key) {
-    if (artCache[key]) return artCache[key];
-    const b = T.SPR[key], pal = T.ART[key] || { mode: 'outline', body: '#ffffff' };
-    const w = b.w, h = b.h, W2 = w + 2, H2 = h + 2, ink = pal.ink || INK;
-    const get = (x, y) => (x < 0 || y < 0 || x >= w || y >= h) ? 0 : b.data[y * w + x];
-    // flood-fill "outside" over empty cells on a 1px padded grid
-    const out = new Uint8Array(W2 * H2), st = [0];
-    out[0] = 1;
-    while (st.length) {
-      const i = st.pop(), x = i % W2 - 1, y = Math.floor(i / W2) - 1;
-      [[1, 0], [-1, 0], [0, 1], [0, -1]].forEach(([dx, dy]) => {
-        const nx = x + dx, ny = y + dy;
-        if (nx < -1 || ny < -1 || nx > w || ny > h) return;
-        const j = (ny + 1) * W2 + nx + 1;
-        if (!out[j] && get(nx, ny) === 0) { out[j] = 1; st.push(j); }
-      });
-    }
-    // sizes of enclosed empty components (small = eyes, big = belly/face)
-    const comp = new Int32Array(W2 * H2).fill(-1), sizes = [];
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-      const j = (y + 1) * W2 + x + 1;
-      if (get(x, y) !== 0 || out[j] || comp[j] >= 0) continue;
-      const id = sizes.length, q = [j]; comp[j] = id; let n = 0;
-      while (q.length) {
-        const k = q.pop(); n++;
-        const kx = k % W2 - 1, ky = Math.floor(k / W2) - 1;
-        [[1, 0], [-1, 0], [0, 1], [0, -1]].forEach(([dx, dy]) => {
-          const nx = kx + dx, ny = ky + dy, m = (ny + 1) * W2 + nx + 1;
-          if (nx >= 0 && ny >= 0 && nx < w && ny < h && get(nx, ny) === 0 && !out[m] && comp[m] < 0) { comp[m] = id; q.push(m); }
-        });
-      }
-      sizes.push(n);
-    }
-    const px = [];
-    for (let y = -1; y <= h; y++) for (let x = -1; x <= w; x++) {
-      const v = get(x, y), j = (y + 1) * W2 + x + 1;
-      let c = null;
-      if (pal.mode === 'filled') {
-        if (v === 1) c = (get(x, y + 1) !== 1 && y > h * 0.45) ? (pal.shade || pal.body) : pal.body;
-        else if (v === 2) c = '#ffffff';
-        else if (!out[j]) c = sizes[comp[j]] <= 6 ? ink : (pal.belly || '#ffffff');
-        else if (get(x + 1, y) === 1 || get(x - 1, y) === 1 || get(x, y + 1) === 1 || get(x, y - 1) === 1) c = ink;
-      } else {
-        if (v === 1) c = ink;
-        else if (v === 2) c = '#ffffff';
-        else if (!out[j]) c = (pal.shade && y > h * 0.55 && get(x, y + 1) === 1) ? pal.shade : pal.body;
-      }
-      if (c) px.push(x, y, c);
-    }
-    return (artCache[key] = { w, h, px });
-  }
-
-  // ------------------------------------------------------------ deterministic noise
-  const hash = (n) => { n = (n ^ 61) ^ (n >>> 16); n = (n + (n << 3)) | 0; n ^= n >>> 4; n = Math.imul(n, 0x27d4eb2d); n ^= n >>> 15; return (n >>> 0) / 4294967295; };
-
-  const ENV = {
-    day:   { sky: ['#4fb3ff', '#6cc4ff', '#8ad3ff', '#a9e2ff', '#c9eeff'], hillFar: '#8fd18a', hillNear: '#63bb5c',
-             grass: ['#6fcb4a', '#63bf40', '#58b23a', '#4ea634'], tuft: '#3f8f2a', tuftHi: '#8fe06a', flowers: ['#ffffff', '#ffe14d', '#ff8fb8', '#9fb8ff'] },
-    dusk:  { sky: ['#1f2466', '#343087', '#553a9c', '#8a4c9f', '#d7708f'], hillFar: '#3c5f6e', hillNear: '#2f5a4a',
-             grass: ['#3f7d4a', '#397244', '#33683e', '#2d5e38'], tuft: '#244d2d', tuftHi: '#5a9a5f', flowers: ['#d8d0f0', '#e8c96a', '#d88aa8', '#8a9ad8'] },
-    night: { sky: ['#070a1f', '#0b1030', '#10173f', '#16204e', '#1d2b5c'], hillFar: '#1b2a45', hillNear: '#14263a',
-             grass: ['#1d3a33', '#1a342e', '#172f2a', '#142a26'], tuft: '#0f211d', tuftHi: '#2d5248', flowers: ['#5a6480', '#6b6a4a', '#6a4a60', '#44507a'] },
-    arena: { sky: ['#ff9a5a', '#ffb36b', '#ffc97d', '#ffdb95', '#ffe9b3'], hillFar: '#8a5a8c', hillNear: '#6d4a78',
-             grass: ['#f0cf8a', '#e8c27a', '#dfb56c', '#d6a95f'], tuft: '#b88a48', tuftHi: '#fff0c0', flowers: [] }
+  const C = T.CONFIG, M = T.Monsters;
+  const UI = {
+    panel: 'rgba(22, 28, 40, 0.94)', edge: '#0a0d13', border: '#8d9db5', inner: '#2b3549',
+    text: '#e6ebf2', dim: '#8e9bb0', accent: '#e0ad48', red: '#d4524a', green: '#5cb86a', yellow: '#dcc043', blue: '#6f9fd8'
   };
+  T.UI = UI;
+  T.INK = UI.text;
+
+  // ------------------------------------------------------------ colour helpers
+  const hex = (h) => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  const rgb = (c) => 'rgb(' + c.map(v => Math.max(0, Math.min(255, v | 0))).join(',') + ')';
+  const TINT = {
+    day: (c) => c,
+    battle: (c) => [c[0] * 1.02, c[1] * 1.02, c[2] * 1.0],
+    dusk: (c) => [c[0] * 0.72 + 22, c[1] * 0.58 + 12, c[2] * 0.62 + 30],
+    night: (c) => [c[0] * 0.22 + 4, c[1] * 0.3 + 8, c[2] * 0.46 + 24]
+  };
+  const tint = (h, env) => rgb((TINT[env] || TINT.day)(hex(h)));
+  const hash = (n) => { n = (n ^ 61) ^ (n >>> 16); n = (n + (n << 3)) | 0; n ^= n >>> 4; n = Math.imul(n, 0x27d4eb2d); n ^= n >>> 15; return (n >>> 0) / 4294967295; };
+  const h2 = (x, y) => hash((x * 73856093) ^ (y * 19349663));
+  const vnoise = (x, y, s) => {            // smooth value noise
+    const X = Math.floor(x / s), Y = Math.floor(y / s), fx = x / s - X, fy = y / s - Y;
+    const a = h2(X, Y), b = h2(X + 1, Y), c = h2(X, Y + 1), d = h2(X + 1, Y + 1);
+    const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+  };
+
+  const SKY = {
+    day:    ['#6f8fae', '#7b99b6', '#89a4bf', '#98b0c7', '#a9bdcf'],
+    battle: ['#6f8fae', '#7b99b6', '#89a4bf', '#98b0c7', '#a9bdcf'],
+    dusk:   ['#262a45', '#363655', '#4d4461', '#6c5667', '#8a6a6a'],
+    night:  ['#070b17', '#0a0f1e', '#0d1325', '#10182c', '#131d33']
+  };
+  const G = { g0: '#1c3019', g1: '#253f21', g2: '#30502a', g3: '#3d6133', g4: '#4f7541',
+              t0: '#15241a', t1: '#1f3524', t2: '#2b472d', t3: '#3b5d38', t4: '#50764a',
+              d0: '#3a2c1f', d1: '#4f3d2a', d2: '#654f37', d3: '#7b6447', mt: '#61778f', mt2: '#51677a' };
 
   function Scene(canvas) {
     this.c = canvas; this.ctx = canvas.getContext('2d');
     this.W = C.STAGE_W; this.H = C.STAGE_H;
-    this.scale = 8; this.sw = 48; this.sh = 100; this.sx0 = 0; this.sy0 = 40; this.horizon = 44;
-    this.bgCache = null;
+    this.scale = 4; this.sw = 96; this.sh = 200; this.sx0 = 0; this.sy0 = 90; this.horizon = 100; this.top = 0; this.bot = 0;
+    this.bgCache = null; this.frame = 0;
   }
   const P = Scene.prototype;
 
-  /** Size the scene to the viewport. topPx/botPx = height of the UI bars that overlay it. */
   P.resize = function (vw, vh, topPx, botPx) {
-    const s = Math.max(3, Math.min(12, Math.floor(Math.min(vw / C.STAGE_W, vh / 70))));
+    const s = Math.max(2, Math.min(10, Math.floor(Math.min(vw / C.STAGE_W, vh / 150))));
     this.scale = s;
     this.sw = Math.max(C.STAGE_W, Math.ceil(vw / s));
     this.sh = Math.ceil(vh / s);
-    const top = Math.ceil(topPx / s), bot = Math.ceil(botPx / s);
-    this.top = top; this.bot = bot;
-    const visible = this.sh - top - bot;
+    this.top = Math.ceil(topPx / s); this.bot = Math.ceil(botPx / s);
+    const visible = this.sh - this.top - this.bot;
     this.sx0 = Math.floor((this.sw - this.W) / 2);
-    this.sy0 = top + Math.max(0, Math.round((visible - this.H) * 0.5));
-    this.horizon = this.sy0 + 4;
+    this.sy0 = this.top + Math.max(0, Math.round((visible - this.H) * 0.6));
+    this.horizon = this.sy0 - 12;
     this.c.width = this.sw; this.c.height = this.sh;
     const cw = this.sw * s, ch = this.sh * s;
     Object.assign(this.c.style, { width: cw + 'px', height: ch + 'px', left: Math.floor((vw - cw) / 2) + 'px', top: '0px' });
     this.bgCache = null;
     this.ctx.imageSmoothingEnabled = false;
   };
-  /** Client (CSS px) -> stage coordinates. */
-  P.toStage = function (clientX, clientY) {
-    const r = this.c.getBoundingClientRect();
-    return { x: (clientX - r.left) / this.scale - this.sx0, y: (clientY - r.top) / this.scale - this.sy0 };
-  };
-  P.toClient = function (sx, sy) {
-    const r = this.c.getBoundingClientRect();
-    return { x: r.left + (sx + this.sx0) * this.scale, y: r.top + (sy + this.sy0) * this.scale };
+  P.toStage = function (cx, cy) { const r = this.c.getBoundingClientRect(); return { x: (cx - r.left) / this.scale - this.sx0, y: (cy - r.top) / this.scale - this.sy0 }; };
+  P.toClient = function (sx, sy) { const r = this.c.getBoundingClientRect(); return { x: r.left + (sx + this.sx0) * this.scale, y: r.top + (sy + this.sy0) * this.scale }; };
+  /** Visible stage-space rectangle between the HUD bars. */
+  P.bounds = function () { return { left: -this.sx0, right: this.sw - this.sx0, top: this.top - this.sy0, bottom: this.sh - this.bot - this.sy0 }; };
+  P.horizonFor = function (env) {
+    if (env === 'battle') { const b = this.bounds(); return this.sy0 + b.top + Math.round((b.bottom - b.top) * 0.3); }
+    return this.horizon;
   };
 
   // ------------------------------------------------------------ background
   P.begin = function (t, env) {
-    this.env = env;
-    const ctx = this.ctx, E = ENV[env] || ENV.day;
+    this.env = env; this.t = t; this.frame = Math.floor(t / 650) % 2;
+    const ctx = this.ctx;
     ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1;
-    const key = env + this.sw + 'x' + this.sh + ':' + this.horizon;
-    if (!this.bgCache || this.bgCache.key !== key) this.bgCache = { key, img: this.paintStatic(E, env) };
+    const key = env + this.sw + 'x' + this.sh + ':' + this.sy0 + ':' + this.top + ':' + this.bot;
+    if (!this.bgCache || this.bgCache.key !== key) this.bgCache = { key, img: this.paintStatic(env) };
     ctx.drawImage(this.bgCache.img, 0, 0);
-    this.paintAnimated(t, E, env);
+    this.paintAnimated(t, env);
     ctx.setTransform(1, 0, 0, 1, this.sx0, this.sy0);
   };
-  P.paintStatic = function (E, env) {
+
+  P.paintStatic = function (env) {
     const cv = document.createElement('canvas'); cv.width = this.sw; cv.height = this.sh;
-    const g = cv.getContext('2d'), W = this.sw, hz = this.horizonFor(env);
-    // sky bands with a dithered seam
-    const n = E.sky.length, bh = Math.max(1, Math.ceil(hz / n));
-    for (let y = 0; y < hz; y++) {
-      const bi = Math.min(n - 1, Math.floor(y / bh)), last = (y % bh) === bh - 1 && bi < n - 1;
-      g.fillStyle = E.sky[bi]; g.fillRect(0, y, W, 1);
-      if (last) { g.fillStyle = E.sky[bi + 1]; for (let x = (y % 2); x < W; x += 2) g.fillRect(x, y, 1, 1); }
+    const g = cv.getContext('2d'), W = this.sw, Hh = this.sh, hz = this.horizonFor(env);
+    const dot = (x, y, c) => { g.fillStyle = c; g.fillRect(x, y, 1, 1); };
+    // --- ground & scenery in daylight colours (tinted per environment afterwards)
+    // far mountains
+    for (let x = 0; x < W; x++) {
+      const h = Math.round(10 + 7 * vnoise(x, 3, 22) + 3 * vnoise(x, 9, 7));
+      g.fillStyle = G.mt; g.fillRect(x, hz - 8 - h, 1, h + 8);
+      const h2v = Math.round(5 + 5 * vnoise(x + 300, 1, 14));
+      g.fillStyle = G.mt2; g.fillRect(x, hz - 6 - h2v, 1, h2v + 6);
     }
-    if (env === 'arena') {
-      // stands with a crowd
-      g.fillStyle = '#7a4b7e'; g.fillRect(0, hz - 7, W, 7);
-      g.fillStyle = '#5e3a66'; g.fillRect(0, hz - 7, W, 1); g.fillRect(0, hz - 4, W, 1);
-      const crowd = ['#ffe14d', '#ff8fb8', '#9fe0ff', '#ffffff', '#8fe06a'];
-      for (let x = 0; x < W; x++) for (let r = 0; r < 2; r++) if (hash(x * 7 + r * 131) > 0.45) { g.fillStyle = crowd[Math.floor(hash(x + r * 99) * 5)]; g.fillRect(x, hz - 6 + r * 3, 1, 1); }
-      for (let x = 2; x < W; x += 9) { g.fillStyle = '#e8263b'; g.fillRect(x, hz - 12, 1, 5); g.fillStyle = '#ffd84a'; g.fillRect(x + 1, hz - 12, 2, 2); }
-    } else {
-      // far & near hills
-      for (let x = 0; x < W; x++) {
-        const hf = Math.round(3 + 2 * Math.sin(x * 0.19 + 1.3) + Math.sin(x * 0.07));
-        g.fillStyle = E.hillFar; g.fillRect(x, hz - hf, 1, hf);
-        const hn = Math.round(1 + 1.5 * Math.sin(x * 0.31 + 4) + 0.8 * Math.sin(x * 0.11 + 2));
-        if (hn > 0) { g.fillStyle = E.hillNear; g.fillRect(x, hz - hn, 1, hn); }
+    // treeline (round crowns + a few conifers)
+    for (let i = -2, x = -4; x < W + 6; i++) {
+      const r = 3 + Math.floor(hash(i * 13 + 7) * 4), cy = hz - r - 1 - Math.floor(hash(i * 5 + 3) * 3);
+      if (hash(i * 31 + 1) < 0.22) {            // conifer
+        const hgt = 10 + Math.floor(hash(i + 77) * 6);
+        for (let y = 0; y < hgt; y++) {
+          const w = Math.floor((y / hgt) * 4.5) + ((y % 3) === 2 ? 1 : 0);
+          for (let dx = -w; dx <= w; dx++) {
+            const c = dx < -w / 3 ? G.t3 : dx > w / 3 ? G.t0 : G.t1;
+            dot(x + dx, hz - hgt - 1 + y, h2(x + dx, y) > 0.85 ? G.t2 : c);
+          }
+        }
+        x += 5;
+      } else {
+        for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+          const d = (dx * dx + dy * dy) / (r * r);
+          if (d > 1 || (d > 0.75 && h2(x + dx, cy + dy) > 0.6)) continue;
+          const l = -(dx + dy * 1.3) / (r * 1.8) + (h2(x + dx, cy + dy) - 0.5) * 0.5;
+          dot(x + dx, cy + dy, l > 0.55 ? G.t4 : l > 0.15 ? G.t3 : l > -0.35 ? G.t2 : G.t1);
+        }
+        g.fillStyle = G.t1; g.fillRect(x - r + 1, cy + 1, r * 2 - 1, hz - cy - 1);
+        x += r + 1 + Math.floor(hash(i * 3 + 9) * 3);
       }
     }
-    // ground bands
-    const gn = E.grass.length, gh = Math.max(2, Math.ceil((this.sh - hz) / gn));
-    for (let y = hz; y < this.sh; y++) {
-      const bi = Math.min(gn - 1, Math.floor((y - hz) / gh)), last = ((y - hz) % gh) === gh - 1 && bi < gn - 1;
-      g.fillStyle = E.grass[bi]; g.fillRect(0, y, W, 1);
-      if (last) { g.fillStyle = E.grass[bi + 1]; for (let x = (y % 2); x < W; x += 2) g.fillRect(x, y, 1, 1); }
+    g.fillStyle = G.t0; g.fillRect(0, hz - 1, W, 1);
+    // grass field: mottled base + blade texture
+    for (let y = hz; y < Hh; y++) {
+      const depth = (y - hz) / Math.max(1, Hh - hz);
+      for (let x = 0; x < W; x++) {
+        const m = vnoise(x, y * 1.6, 9) * 0.7 + vnoise(x, y, 3) * 0.3, n = h2(x, y);
+        let c = m > 0.62 ? G.g3 : m > 0.36 ? G.g2 : G.g1;
+        if (n < 0.08) c = G.g1; else if (n > 0.93) c = G.g4;
+        if (depth < 0.08 && n > 0.5) c = G.g2;
+        dot(x, y, c);
+      }
     }
-    if (env === 'arena') {
-      // ring on the sand, centred under the fighters
-      const cx = this.sx0 + this.W / 2, cy = this.sy0 + this.H - 1, rx = this.W / 2 - 1, ry = 3;
-      g.fillStyle = '#fff4d8';
-      for (let a = 0; a < Math.PI * 2; a += 0.02) g.fillRect(Math.round(cx + Math.cos(a) * rx), Math.round(cy + Math.sin(a) * ry), 1, 1);
-      g.fillStyle = 'rgba(0,0,0,0.06)';
-      for (let y = hz + 2; y < this.sh; y += 4) for (let x = (y % 8 ? 0 : 4); x < W; x += 8) g.fillRect(x, y, 2, 1);
+    const blades = Math.floor(W * (Hh - hz) / 9);
+    for (let i = 0; i < blades; i++) {
+      const x = Math.floor(hash(i * 7 + 1) * W), y = hz + 2 + Math.floor(hash(i * 7 + 2) * (Hh - hz));
+      const tall = 1 + Math.floor(((y - hz) / (Hh - hz)) * 2.5);
+      for (let k = 0; k < tall; k++) dot(x, y - k, G.g0);
+      dot(x + (hash(i) > 0.5 ? 1 : -1), y - tall, G.g4);
     }
-    if (env !== 'arena') this.paintDecor(g, E, env);
+    if (env !== 'battle') {
+      // dirt path across the meadow under the pet's lane
+      const py0 = this.sy0 + this.H - 8, py1 = this.sy0 + this.H + 5;
+      for (let y = py0 - 2; y < py1 + 2; y++) for (let x = 0; x < W; x++) {
+        const edgeT = py0 + Math.round(vnoise(x, 1, 6) * 3) - 1, edgeB = py1 - Math.round(vnoise(x, 7, 6) * 3) + 1;
+        if (y < edgeT || y > edgeB) continue;
+        const n = h2(x, y), m = vnoise(x, y, 4);
+        let c = m > 0.6 ? G.d2 : m > 0.3 ? G.d1 : G.d1;
+        if (y === edgeT) c = G.d0; else if (y === edgeT + 1 && n > 0.4) c = G.d3;
+        if (n > 0.95) c = G.d3; else if (n < 0.05) c = G.d0;
+        dot(x, y, c);
+      }
+      // pebbles
+      for (let i = 0; i < W / 6; i++) {
+        const x = Math.floor(hash(i * 11 + 400) * W), y = py0 + 2 + Math.floor(hash(i * 11 + 401) * (py1 - py0 - 3));
+        dot(x, y, G.d3); dot(x + 1, y, G.d2); dot(x, y + 1, G.d0);
+      }
+      // rocks
+      this.stampArt(g, 'rock', Math.floor(W * 0.08), Math.min(Hh - this.bot - 16, py1 + 14));
+      this.stampArt(g, 'rockS', W - Math.floor(W * 0.2), hz + 3);
+    }
+    // --- tint to environment
+    if (env !== 'day') {
+      const id = g.getImageData(0, 0, W, Hh), d = id.data, f = TINT[env];
+      for (let i = 0; i < d.length; i += 4) { if (!d[i + 3]) continue; const c = f([d[i], d[i + 1], d[i + 2]]); d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2]; }
+      g.putImageData(id, 0, 0);
+    }
+    // --- sky behind everything
+    g.globalCompositeOperation = 'destination-over';
+    const sky = SKY[env] || SKY.day, n = sky.length, top = hz - 26, bh = Math.max(2, Math.ceil(Math.max(1, top) / n));
+    for (let y = 0; y < hz; y++) {
+      const bi = Math.min(n - 1, Math.max(0, Math.floor(y / bh))), last = (y % bh) === bh - 1 && bi < n - 1;
+      g.fillStyle = sky[bi]; g.fillRect(0, y, W, 1);
+      if (last) { g.fillStyle = sky[bi + 1]; for (let x = (y % 2); x < W; x += 2) g.fillRect(x, y, 1, 1); }
+    }
+    g.globalCompositeOperation = 'source-over';
     return cv;
   };
-  /** A tree on the left horizon and a couple of bushes / rocks in the foreground. */
-  P.paintDecor = function (g, E, env) {
-    const dark = env !== 'day', hz = this.horizon;
-    const leaf = dark ? ['#16352c', '#1d4436', '#26543f'] : ['#2f8a3a', '#3fa548', '#5cc25a'];
-    const trunk = dark ? '#2a1c1c' : '#7a4a2a';
-    const tx = Math.max(1, this.sx0 - 6), ty = hz + 1;
-    g.fillStyle = trunk; g.fillRect(tx + 4, ty - 6, 2, 7);
-    const blob = (cx, cy, r, c) => { g.fillStyle = c; for (let y = -r; y <= r; y++) { const w = Math.round(Math.sqrt(r * r - y * y)); g.fillRect(cx - w, cy + y, w * 2 + 1, 1); } };
-    blob(tx + 5, ty - 10, 5, leaf[0]); blob(tx + 4, ty - 11, 4, leaf[1]); blob(tx + 3, ty - 12, 2, leaf[2]);
-    if (!dark) { g.fillStyle = '#ff5a5a'; g.fillRect(tx + 7, ty - 9, 1, 1); g.fillRect(tx + 2, ty - 8, 1, 1); g.fillRect(tx + 5, ty - 13, 1, 1); }
-    // foreground bushes & rocks (below the pet lane)
-    const fy = Math.min(this.sh - (this.bot || 0) - 4, this.sy0 + this.H + 12);
-    if (fy > this.sy0 + this.H + 4) {
-      const bx = this.sx0 + this.W - 12;
-      blob(bx, fy, 3, leaf[0]); blob(bx + 4, fy + 1, 3, leaf[1]); blob(bx + 2, fy - 1, 2, leaf[2]);
-      const rx = this.sx0 + 4;
-      g.fillStyle = dark ? '#3a3f4a' : '#9aa0ad'; g.fillRect(rx, fy, 5, 2); g.fillRect(rx + 1, fy - 1, 3, 1);
-      g.fillStyle = dark ? '#555b68' : '#c4c9d4'; g.fillRect(rx + 1, fy - 1, 2, 1);
-    }
+  P.stampArt = function (g, key, x, y) {
+    const a = M.get(key, 0); if (!a) return;
+    for (let i = 0; i < a.px.length; i += 3) { g.fillStyle = a.px[i + 2]; g.fillRect(x + a.px[i], y - a.h + a.px[i + 1], 1, 1); }
   };
-  P.horizonFor = function (env) {
-    return env === 'arena' ? Math.max((this.top || 0) + 9, this.sy0 - 22) : this.horizon;
-  };
-  P.paintAnimated = function (t, E, env) {
-    const g = this.ctx, W = this.sw, hz = this.horizonFor(env), s = t / 1000;
+
+  P.paintAnimated = function (t, env) {
+    const g = this.ctx, W = this.sw, Hh = this.sh, hz = this.horizonFor(env), s = t / 1000;
     const dot = (x, y, c) => { g.fillStyle = c; g.fillRect(x, y, 1, 1); };
+    // stars (night: subtle; dusk: very few)
     if (env === 'night' || env === 'dusk') {
-      const stars = Math.floor(W * hz / (env === 'night' ? 28 : 60));
-      for (let i = 0; i < stars; i++) {
-        const x = Math.floor(hash(i * 3 + 1) * W), y = Math.floor(hash(i * 3 + 2) * (hz - 6));
-        const tw = Math.sin(s * (1.5 + hash(i) * 2) + i);
-        if (tw > -0.3) dot(x, y, tw > 0.7 ? '#ffffff' : '#9fb0e0');
-        if (tw > 0.93 && env === 'night') { dot(x - 1, y, '#6a7ab0'); dot(x + 1, y, '#6a7ab0'); dot(x, y - 1, '#6a7ab0'); dot(x, y + 1, '#6a7ab0'); }
+      const n = Math.floor(W * hz / (env === 'night' ? 70 : 220));
+      for (let i = 0; i < n; i++) {
+        const x = Math.floor(hash(i * 3 + 1) * W), y = Math.floor(hash(i * 3 + 2) * (hz - 30));
+        const tw = Math.sin(s * (0.8 + hash(i) * 1.2) + i * 2.1);
+        if (tw > -0.5) dot(x, y, tw > 0.85 && hash(i + 5) > 0.6 ? '#c9d2ea' : env === 'night' ? '#6f7c9c' : '#8c8aa0');
       }
-      // moon
-      const mx = Math.floor(W * 0.72), my = (this.top || 0) + 3;
-      g.fillStyle = env === 'night' ? '#fff6c8' : '#ffe9a8';
-      [[1, 0, 3], [0, 1, 5], [0, 2, 5], [0, 3, 5], [1, 4, 3]].forEach(([dx, dy, w]) => g.fillRect(mx + dx, my + dy, w, 1));
-      g.fillStyle = E.sky[0]; g.fillRect(mx + 3, my + 1, 2, 3);
-    } else if (env === 'day') {
-      // sun with twinkling rays
-      const sx = Math.floor(W * 0.72), sy = (this.top || 0) + 4, on = Math.floor(s * 2) % 2;
-      g.fillStyle = '#fff3a0'; [[1, 0, 3], [0, 1, 5], [0, 2, 5], [0, 3, 5], [1, 4, 3]].forEach(([dx, dy, w]) => g.fillRect(sx + dx, sy + dy, w, 1));
-      g.fillStyle = '#ffd84a'; g.fillRect(sx + 1, sy + 1, 3, 3);
-      g.fillStyle = '#fff3a0';
-      if (on) { g.fillRect(sx + 2, sy - 2, 1, 1); g.fillRect(sx + 2, sy + 6, 1, 1); g.fillRect(sx - 2, sy + 2, 1, 1); g.fillRect(sx + 6, sy + 2, 1, 1); }
-      else { g.fillRect(sx - 1, sy - 1, 1, 1); g.fillRect(sx + 5, sy - 1, 1, 1); g.fillRect(sx - 1, sy + 5, 1, 1); g.fillRect(sx + 5, sy + 5, 1, 1); }
+      if (env === 'night') { const mx = Math.floor(W * 0.74), my = this.top + 8; g.fillStyle = '#c8ccd6'; g.fillRect(mx + 1, my, 2, 1); g.fillRect(mx, my + 1, 2, 2); g.fillRect(mx + 1, my + 3, 2, 1); }
     }
-    if (env !== 'arena') {
-      // drifting clouds
-      const clouds = [['cloud', 0.9, 3, 0], ['cloudS', 0.55, 9, 17], ['cloud', 0.35, 14, 41], ['cloudS', 0.75, 1, 63]];
-      g.globalAlpha = env === 'day' ? 1 : env === 'dusk' ? 0.45 : 0.18;
-      for (const [k, sp, yy, off] of clouds) {
-        const y = yy + (this.top || 0);
-        if (y > hz - 8) continue;
-        const a = colorize(k), span = W + a.w + 4;
-        const x = Math.floor(((s * sp + off) % span + span) % span) - a.w - 2;
-        this.drawArt(a, x, y, false);
-      }
-      g.globalAlpha = 1;
-      // swaying grass tufts & flowers
-      const area = W * (this.sh - hz), tufts = Math.floor(area / 10);
-      for (let i = 0; i < tufts; i++) {
-        const x = Math.floor(hash(i * 5 + 11) * W), y = hz + 2 + Math.floor(hash(i * 5 + 12) * (this.sh - hz - 2));
-        const sway = Math.round(Math.sin(s * 1.6 + x * 0.35 + y * 0.2) * 0.8);
-        dot(x, y, E.tuft); dot(x + sway, y - 1, E.tuft);
-        if (hash(i * 5 + 13) > 0.6) dot(x + sway, y - 2, E.tuftHi);
-      }
-      if (E.flowers.length) {
-        const fl = Math.floor(area / 70);
-        for (let i = 0; i < fl; i++) {
-          const x = 1 + Math.floor(hash(i * 7 + 501) * (W - 2)), y = hz + 4 + Math.floor(hash(i * 7 + 502) * (this.sh - hz - 5));
-          if (y > this.sy0 + 9 && y < this.sy0 + this.H + 2 && x > this.sx0 - 2 && x < this.sx0 + this.W + 2) continue;   // keep the pet lane clear
-          const sway = Math.round(Math.sin(s * 1.3 + i) * 0.6), col = E.flowers[Math.floor(hash(i * 7 + 503) * E.flowers.length)];
-          dot(x, y, E.tuft); dot(x + sway, y - 1, E.tuft);
-          const hx = x + sway, hy = y - 2;
-          dot(hx, hy - 1, col); dot(hx - 1, hy, col); dot(hx + 1, hy, col); dot(hx, hy + 1, col);
-          dot(hx, hy, env === 'day' ? '#ffb300' : '#8a7a40');
+    // soft clouds
+    if (env !== 'night') {
+      const cl = env === 'dusk' ? ['#6d5a6c', '#5a4a60'] : ['#c9d3dc', '#aebccb'];
+      const clouds = [[0.35, 10, 0, 14, 3], [0.22, 22, 37, 20, 4], [0.5, 34, 71, 10, 2]];
+      for (const [sp, yy, off, w, hgt] of clouds) {
+        const y = this.top + yy; if (y > hz - 30) continue;
+        const span = W + w * 2, x0 = Math.floor(((s * sp + off) % span + span) % span) - w;
+        for (let dy = 0; dy < hgt; dy++) {
+          const ww = w - Math.abs(dy - hgt / 2) * 3;
+          g.fillStyle = dy >= hgt - 1 ? cl[1] : cl[0];
+          g.fillRect(x0 + Math.floor((w - ww) / 2), y + dy, Math.max(2, Math.floor(ww)), 1);
         }
       }
-      if (env === 'night') {   // fireflies
-        for (let i = 0; i < 6; i++) {
-          const x = Math.floor((hash(i + 900) * W + Math.sin(s * 0.4 + i) * 6 + W) % W), y = hz + 3 + Math.floor(hash(i + 950) * 20 + Math.sin(s * 0.7 + i * 2) * 2);
-          if (Math.sin(s * 2 + i * 1.7) > 0) dot(x, y, '#e8ff7a');
+    }
+    // tall grass tufts (sway between two frames)
+    const pal = ['#132114', '#244222', '#355f2e', '#4b7a3d'].map(c => tint(c, env === 'battle' ? 'day' : env));
+    const lane0 = this.sy0 + this.H - 12, lane1 = this.sy0 + this.H + 7;
+    const count = Math.floor(W * (Hh - hz) / 170);
+    for (let i = 0; i < count; i++) {
+      const x = Math.floor(hash(i * 9 + 1000) * (W + 6)) - 3, y = hz + 4 + Math.floor(hash(i * 9 + 1001) * (Hh - hz - 4));
+      if (env !== 'battle' && y > lane0 && y < lane1) continue;
+      const depth = (y - hz) / (Hh - hz), size = 3 + Math.floor(depth * 5) + Math.floor(hash(i + 3) * 2);
+      const sway = ((this.frame + (i % 2)) % 2) ? 1 : 0;
+      for (let b = 0; b < 4; b++) {
+        const bx = x + b * 2 - 3, hgt = size - (b === 0 || b === 3 ? 2 : 0), lean = (b - 1.5) * 0.6 + sway * 0.8;
+        for (let k = 0; k < hgt; k++) {
+          const px = Math.round(bx + lean * k / hgt), py = y - k;
+          dot(px - 1, py, pal[0]);
+          dot(px, py, k > hgt - 2 ? pal[3] : k > hgt / 2 ? pal[2] : pal[1]);
         }
+      }
+    }
+    if (env === 'night') {       // a few faint fireflies
+      for (let i = 0; i < 4; i++) {
+        const x = Math.floor((hash(i + 900) * W + Math.sin(s * 0.4 + i) * 5 + W) % W), y = hz + 6 + Math.floor(hash(i + 950) * 40 + Math.sin(s * 0.6 + i * 2) * 2);
+        if (Math.sin(s * 1.6 + i * 1.7) > 0.3) dot(x, y, '#b9c86a');
       }
     }
   };
 
-  // ------------------------------------------------------------ drawing API (stage coordinates)
-  P.drawArt = function (a, x, y, flip, silhouette) {
-    const g = this.ctx, px = a.px;
-    for (let i = 0; i < px.length; i += 3) {
-      const ix = flip ? a.w - 1 - px[i] : px[i];
-      g.fillStyle = silhouette || px[i + 2];
-      g.fillRect(x + ix, y + px[i + 1], 1, 1);
-    }
-  };
-  /** Colourised sprite (creatures & props). opts: {flip, silhouette, alpha, clipX} */
+  // ------------------------------------------------------------ sprites
+  /** Monster / prop sprite. opts: {flip, silhouette, alpha, clipX, frame} */
   P.art = function (key, x, y, opts) {
     opts = opts || {};
-    const a = colorize(key);
+    const a = M.get(key, opts.frame || 0);
+    if (!a) return;
     const g = this.ctx;
     if (opts.alpha != null) g.globalAlpha = opts.alpha;
     if (opts.clipX) { g.save(); g.beginPath(); g.rect(x + opts.clipX, y - 2, a.w + 4, a.h + 4); g.clip(); }
-    this.drawArt(a, Math.round(x), Math.round(y), !!opts.flip, opts.silhouette);
+    const X = Math.round(x), Y = Math.round(y), px = a.px;
+    for (let i = 0; i < px.length; i += 3) {
+      g.fillStyle = opts.silhouette || px[i + 2];
+      g.fillRect(X + (opts.flip ? a.w - 1 - px[i] : px[i]), Y + px[i + 1], 1, 1);
+    }
     if (opts.clipX) g.restore();
     g.globalAlpha = 1;
   };
-  /** Single-colour 1-bit glyph. */
+  P.size = function (key) { return M.size(key) || { w: 0, h: 0 }; };
+  /** Single-colour 1-bit glyph (icons, emotes). */
   P.glyph = function (key, x, y, color, flip) {
     const b = typeof key === 'string' ? T.SPR[key] : key, g = this.ctx;
-    g.fillStyle = color || (typeof key === 'string' && T.TINT[key]) || INK;
+    g.fillStyle = color || UI.text;
     for (let j = 0; j < b.h; j++) for (let i = 0; i < b.w; i++) {
       if (b.data[j * b.w + (flip ? b.w - 1 - i : i)] === 1) g.fillRect(Math.round(x) + i, Math.round(y) + j, 1, 1);
     }
   };
+  /** Small outlined emote glyph (subtle, no bubble). */
+  P.emote = function (key, x, y, color) {
+    const b = T.SPR[key]; if (!b) return;
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1]]) this.glyph(b, x + dx, y + dy, 'rgba(8,10,14,0.85)');
+    this.glyph(b, x, y, color);
+  };
   P.shadow = function (x, y, w) {
-    const g = this.ctx; g.fillStyle = 'rgba(20, 40, 10, 0.25)';
-    g.fillRect(Math.round(x + 1), Math.round(y), Math.max(1, w - 2), 1);
-    g.fillRect(Math.round(x + 2), Math.round(y + 1), Math.max(1, w - 4), 1);
+    const g = this.ctx; g.fillStyle = 'rgba(10, 16, 8, 0.35)';
+    g.fillRect(Math.round(x + 2), Math.round(y - 1), Math.max(1, w - 4), 2);
+    g.fillRect(Math.round(x + 4), Math.round(y + 1), Math.max(1, w - 8), 1);
   };
-  P.rect = function (x, y, w, h, c) { this.ctx.fillStyle = c || INK; this.ctx.fillRect(x, y, w, h); };
-  P.frame = function (x, y, w, h, c) { this.rect(x, y, w, 1, c); this.rect(x, y + h - 1, w, 1, c); this.rect(x, y, 1, h, c); this.rect(x + w - 1, y, 1, h, c); };
-  P.textW = function (s) { return String(s).length * 4 - 1; };
-  P.text = function (s, x, y, c) {
-    s = String(s).toUpperCase();
-    for (let k = 0; k < s.length; k++) this.glyph(T.FONT[s[k]] || T.FONT['?'], x + k * 4, y, c || INK);
-  };
-  P.textC = function (s, y, c) { this.text(s, Math.floor((this.W - this.textW(s)) / 2), y, c); };
-  /** Pixel panel: paper fill, ink border with cut corners, hard drop shadow. */
-  P.panel = function (x, y, w, h, fill) {
+  /** Grass battle platform (Gen-3 style). */
+  P.platform = function (cx, cy, rx, ry) {
     const g = this.ctx;
-    g.fillStyle = 'rgba(43, 29, 46, 0.35)'; g.fillRect(x + 1, y + h, w - 1, 1); g.fillRect(x + w, y + 1, 1, h);
-    g.fillStyle = fill || PAPER; g.fillRect(x + 1, y + 1, w - 2, h - 2);
-    g.fillStyle = PAPER_SHADE; g.fillRect(x + 1, y + h - 2, w - 2, 1);
-    g.fillStyle = INK;
-    g.fillRect(x + 1, y, w - 2, 1); g.fillRect(x + 1, y + h - 1, w - 2, 1); g.fillRect(x, y + 1, 1, h - 2); g.fillRect(x + w - 1, y + 1, 1, h - 2);
+    for (let y = -ry; y <= ry + 1; y++) for (let x = -rx; x <= rx; x++) {
+      const d = (x * x) / (rx * rx) + (y * y) / (ry * ry);
+      if (d > 1.05) continue;
+      let c = d > 0.8 ? (y > 0 ? '#1f3a1c' : '#3f6a34') : (y < -ry * 0.3 ? '#6b9352' : '#5a8446');
+      if (y > ry * 0.6 && d > 0.55) c = '#2a4a24';
+      if (h2(x + 500, y + 500) > 0.9 && d < 0.8) c = '#4a7a3c';
+      g.fillStyle = tint(c, this.env === 'battle' ? 'day' : this.env);
+      g.fillRect(cx + x, cy + y, 1, 1);
+    }
   };
-  /** Text on a small paper plate, centred horizontally at y. */
-  P.label = function (s, y, c, fill) {
-    const w = this.textW(s) + 4, x = Math.floor((this.W - w) / 2);
-    this.panel(x, y - 2, w, 9, fill); this.text(s, x + 2, y, c);
-  };
-  P.flash = function (x, y, w, h, c) { this.ctx.fillStyle = c || 'rgba(255,255,255,0.55)'; this.ctx.fillRect(x, y, w, h); };
-  /** Tint the whole screen (e.g. dark overlay at night, white flash on evolution). */
-  P.overlay = function (c) {
-    const g = this.ctx; g.save(); g.setTransform(1, 0, 0, 1, 0, 0); g.fillStyle = c; g.fillRect(0, 0, this.sw, this.sh); g.restore();
-  };
-  P.HILITE = HILITE; P.PAPER = PAPER; P.INK = INK;
-  /** Visible stage-space bounds (the scene extends beyond the 48x24 stage). */
-  P.bounds = function () { return { left: -this.sx0, right: this.sw - this.sx0, top: -this.sy0, bottom: this.sh - this.sy0 }; };
 
-  /** Draw a 1-bit icon onto its own little canvas (menu bar buttons). */
+  // ------------------------------------------------------------ UI primitives
+  P.rect = function (x, y, w, h, c) { this.ctx.fillStyle = c || UI.text; this.ctx.fillRect(x, y, w, h); };
+  P.frame = function (x, y, w, h, c) { this.rect(x, y, w, 1, c); this.rect(x, y + h - 1, w, 1, c); this.rect(x, y, 1, h, c); this.rect(x + w - 1, y, 1, h, c); };
+  P.textW = function (s) { return T.textWidth(s); };
+  P.text = function (s, x, y, c) {
+    let cx = Math.round(x);
+    for (const ch of String(s)) { const gl = T.FONT[ch] || T.FONT['?']; this.glyph(gl, cx, y, c || UI.text); cx += gl.w + 1; }
+  };
+  P.textC = function (s, y, c, x0, w) { x0 = x0 || 0; w = w || this.W; this.text(s, x0 + Math.floor((w - this.textW(s)) / 2), y, c); };
+  /** Word-wrap to lines no wider than w. */
+  P.wrap = function (s, w) {
+    const out = []; let line = '';
+    String(s).split(' ').forEach(word => {
+      const tryL = line ? line + ' ' + word : word;
+      if (this.textW(tryL) <= w || !line) line = tryL; else { out.push(line); line = word; }
+    });
+    if (line) out.push(line);
+    return out;
+  };
+  /** Dark slate panel with a thin light border. accent: highlight border colour. */
+  P.panel = function (x, y, w, h, accent, fill) {
+    const g = this.ctx;
+    g.fillStyle = UI.edge; g.fillRect(x + 1, y, w - 2, h); g.fillRect(x, y + 1, w, h - 2);
+    g.fillStyle = fill || UI.panel; g.fillRect(x + 1, y + 1, w - 2, h - 2);
+    g.fillStyle = accent || UI.border;
+    g.fillRect(x + 2, y + 1, w - 4, 1); g.fillRect(x + 2, y + h - 2, w - 4, 1); g.fillRect(x + 1, y + 2, 1, h - 4); g.fillRect(x + w - 2, y + 2, 1, h - 4);
+    g.fillStyle = UI.inner; g.fillRect(x + 2, y + 2, w - 4, 1);
+  };
+  P.label = function (s, y, c, cx) {
+    const lines = this.wrap(s, this.W - 14), tw = Math.max(...lines.map(l => this.textW(l)));
+    const w = tw + 8, x = cx != null ? Math.round(cx - w / 2) : Math.floor((this.W - w) / 2);
+    this.panel(x, y - 3, w, 13 + (lines.length - 1) * 9);
+    lines.forEach((l, i) => this.text(l, x + 4 + Math.floor((tw - this.textW(l)) / 2), y + i * 9, c));
+  };
+  P.button = function (x, y, w, h, label, hi, color) {
+    this.panel(x, y, w, h, hi ? UI.accent : null);
+    this.text(label, x + Math.floor((w - this.textW(label)) / 2), y + Math.floor((h - 6) / 2), color || (hi ? UI.accent : UI.text));
+  };
+  /** HP bar: green > 50%, yellow > 20%, red otherwise. */
+  P.hpBar = function (x, y, w, hp, max) {
+    const r = max ? Math.max(0, hp) / max : 0, col = r > 0.5 ? UI.green : r > 0.2 ? UI.yellow : UI.red;
+    this.text('HP', x, y - 1, UI.accent);
+    const bx = x + 10;
+    this.rect(bx, y, w - 10, 5, UI.edge); this.rect(bx + 1, y + 1, w - 12, 3, '#3a3f4a');
+    const fw = Math.round((w - 12) * r);
+    if (fw > 0) { this.rect(bx + 1, y + 1, fw, 3, col); this.rect(bx + 1, y + 1, fw, 1, 'rgba(255,255,255,0.25)'); }
+  };
+  P.flash = function (x, y, w, h, c) { this.ctx.fillStyle = c || 'rgba(224,173,72,0.35)'; this.ctx.fillRect(x, y, w, h); };
+  P.overlay = function (c) { const g = this.ctx; g.save(); g.setTransform(1, 0, 0, 1, 0, 0); g.fillStyle = c; g.fillRect(0, 0, this.sw, this.sh); g.restore(); };
+  P.UI = UI;
+
+  /** 1-bit icon on its own canvas (HUD buttons). */
   Scene.iconCanvas = function (cv, key, color, scale) {
     const b = T.SPR[key], s = scale || 3, pad = 1;
     cv.width = (b.w + pad * 2) * s; cv.height = (b.h + pad * 2) * s;
-    const g = cv.getContext('2d'); g.clearRect(0, 0, cv.width, cv.height); g.fillStyle = color || INK;
+    const g = cv.getContext('2d'); g.clearRect(0, 0, cv.width, cv.height); g.fillStyle = color || UI.text;
     for (let j = 0; j < b.h; j++) for (let i = 0; i < b.w; i++) if (b.data[j * b.w + i] === 1) g.fillRect((i + pad) * s, (j + pad) * s, s, s);
   };
-  /** Draw a colourised sprite onto a standalone canvas (debug gallery). */
+  /** Monster sprite on a standalone canvas (debug gallery). */
   Scene.artCanvas = function (cv, key, scale, bg) {
-    const a = colorize(key), s = scale || 4, W = 20, H = 20;
+    const a = M.get(key, 0), s = scale || 4, W = 42, H = 42;
     cv.width = W * s; cv.height = H * s;
-    const g = cv.getContext('2d'); g.fillStyle = bg || '#8fd18a'; g.fillRect(0, 0, cv.width, cv.height);
+    const g = cv.getContext('2d'); g.fillStyle = bg || '#30502a'; g.fillRect(0, 0, cv.width, cv.height);
+    if (!a) return;
     const ox = Math.floor((W - a.w) / 2), oy = H - a.h - 1;
     for (let i = 0; i < a.px.length; i += 3) { g.fillStyle = a.px[i + 2]; g.fillRect((ox + a.px[i]) * s, (oy + a.px[i + 1]) * s, s, s); }
   };
-  Scene.colorize = colorize;
   T.Scene = Scene;
 })(window.Tama);

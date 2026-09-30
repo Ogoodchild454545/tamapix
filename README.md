@@ -1,7 +1,9 @@
 # TAMA·PIX — a 90s-style virtual pet (plain HTML/CSS/JS + optional Node server)
 
-A full-screen pixel-art meadow (drifting clouds, swaying grass and flowers; dusk when your pet sleeps, a starry
-night sky when the lights are off, a sandy arena for battles) with chunky, colour, dark-outlined pixel pets.
+A classic monster-RPG look (think Gen 2-3 handheld monster games, less cute): a muted GBA-era meadow with
+textured dark grass, swaying tall-grass tufts, mountains, a treeline and rocks (muted dusk while your pet sleeps,
+a dark-blue night with faint stars when the lights are off), fierce 40×40 shaded monsters with dark outlines and a
+2-frame idle, Gen-3 style battles, and a dark slate RPG interface with a crisp pixel font.
 **Tap-only** controls, fills phones (portrait first) and desktops, branching evolution, and battles against the computer, a friend's code, or a random player online.
 
 ## Play
@@ -19,14 +21,19 @@ night sky when the lights are off, a sandy arena for battles) with chunky, colou
 ## Controls (touch / mouse)
 * **Tap a button in the pixel bars**: feed, light, play, medicine, clean up (top bar); ↩ back, status, discipline,
   battle, ♪ sound (bottom bar). The bell at the top-right flashes when the pet needs something. All buttons are ≥ 44 px.
-* **Sub-screens show pixel panels over the meadow** – tap the choices: MEAL/SNACK, ON/OFF, RANDOM/FRIEND/COMPUTER,
-  play = tap the left or right half, battles = tap the upper half (HI) or lower half (LO), status = tap to flip pages,
-  death = tap, then YES for a new egg.
+* **Sub-screens show dark RPG panels over the meadow** – tap the choices: MEAL/SNACK, LIGHTS ON/OFF,
+  RANDOM ONLINE / FRIEND CODE / VS COMPUTER, play = tap the left or right half, battles = tap HIGH or LOW in the text
+  box, status = tap to flip pages (PROFILE, HUNGER, MOOD, DISCIPLINE, RECORD), death = tap, then YES for a new egg.
 * **↩ (bottom-left) always goes back** – closes menus/status, quits the mini-game, cancels a search, flees a battle.
 * Tap the pet for a little reaction.
 * Optional keyboard: `1`/`A` next, `2`/`B`/Enter OK, `3`/`C`/Esc back, `M` mute.
 
 ## Battles
+Gen-3 style layout: the foe stands top-right on a grass platform, your monster bottom-left; each side has a name
+plate with level and an HP bar (green → yellow → red), and a text box at the bottom narrates ("DRAKON used CLAW
+STRIKE!"), with lunges, hit flashes and screen shake. Levels and the ×10 HP numbers are display only (level =
+stage base + training/2 + wins; the rules use the small HP values from `js/evolution.js`).
+
 Turn-based: players take turns attacking; the attacker picks HI or LO and the defender guesses where to guard.
 A correct guess blocks; a faster defender can sometimes side-step anyway. Every 3rd attack triggers the species'
 special move (see `js/evolution.js`).
@@ -75,13 +82,18 @@ Config: `CONFIG.SERVER_URL` in `js/config.js` (default `''` = same host, `ws(s):
 | `js/battle.js` | battle maths (shared with the server), CPU rivals, friend codes |
 | `js/net.js` | WebSocket client (matchmaking, moves) |
 | `js/game.js` | UI state machine, tap zones, animations, battles, main loop, fit-to-screen |
-| `js/scene.js` | scene renderer: integer-scaled low-res canvas, meadow/dusk/night/arena backgrounds, auto-colourised sprites (flood-fill: outline art gets a body colour, filled art gets an ink outline), panels, labels |
-| `js/sprites.js` | 1-bit pixel art, colour palettes per species (`T.ART`), emote tints, 3×5 font |
+| `js/scene.js` | scene renderer: integer-scaled low-res canvas, cached GBA-style meadow (sky, mountains, treeline, textured grass, rocks; dusk/night by tinting) + animated tufts/clouds/stars, battle field with grass platforms, dark RPG UI helpers (panels, buttons, text boxes, HP bars, emotes) |
+| `js/monsters.js` | monster sprite engine: every form (and props like food, rocks, tomb) is built from shaded parts (ellipses, capsules, polygons) with 4-tone material ramps, top-left light, inner lines and a dark outline; frames 0/1 = idle, 2 = asleep |
+| `js/font.js` | proportional pixel font (upper/lower case, digits, punctuation) |
+| `js/sprites.js` | small 1-bit icons for the HUD buttons and emotes |
 | `js/audio.js`, `js/debug.js` | beeps; hidden debug panel (`?debug=1`) |
 | `server/server.js` | static host + WebSocket matchmaking/battles (`package.json` at the root: dependency `ws`) |
 | `render.yaml`, `.node-version` | Render Blueprint (free web service) and Node version pin |
 | `test_e2e.py` | Playwright tests + screenshots (starts/stops its own servers on :8765) |
 
 ## Evolution
-egg → PIXBIT → MOCHI | KUCHIBO → NEKORU | SCRAPPER | BLOBBO →
-KINGLEO | ROKKUN | STARLA | MIMIKO | CHUBBO | GHOULIE | OYAJI → secret DRAKON | SERAPHI.
+EGG → FANGLET → VULPEX | GNASHER → LYNXAR | TALONIX | MIREBACK →
+KAISERON | BASTION | LUMISTAG | GALEHARE | BEHEMOTH | WRAITH | GRIMTUSK → secret DRAKON | SERAPHIM.
+
+(Internal form ids – `pixbit`, `mochi`, `kingleo`… – are unchanged so old saves and friend codes still work.)
+Gallery of every form: open with `?debug=1`, then *Form gallery* in the debug panel.

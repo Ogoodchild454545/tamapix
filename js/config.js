@@ -19,7 +19,7 @@ window.Tama = window.Tama || {};
     OFFLINE_FACTOR: 0.25,
     MAX_OFFLINE_REAL_MS: 3 * 60 * 60 * 1000,        // at most 3h of real absence is simulated
 
-    STAGE_W: 48, STAGE_H: 24,                       // gameplay stage (logical pixels) inside the full-screen scene
+    STAGE_W: 96, STAGE_H: 48,                       // gameplay stage (logical pixels) inside the full-screen scene
 
     // Online battles. '' = same host as the page (ws(s)://<host>/ws). Override with ?server=wss://host/ws
     // When the page is opened as a file:// (or the server can't be reached) RANDOM falls back to a CPU rival.

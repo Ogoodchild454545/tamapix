@@ -53,6 +53,12 @@ async def tap_lcd(pg, lx, ly, wait=320):
     c = await pg.evaluate(f'Tama.Game.stageToClient({lx + 0.5}, {ly + 0.5})')
     await (pg.touchscreen.tap(c['x'], c['y']) if pg.touch else pg.mouse.click(c['x'], c['y'])); await pg.wait_for_timeout(wait)
 
+async def tap_zone(pg, zid, wait=320):
+    """Tap the on-screen choice/zone with this id (menus, HI/LO, status, pet...)."""
+    c = await pg.evaluate(f"Tama.Game.zonePoint('{zid}')")
+    assert c, f'zone {zid} not on screen'
+    await (pg.touchscreen.tap(c['x'], c['y']) if pg.touch else pg.mouse.click(c['x'], c['y'])); await pg.wait_for_timeout(wait)
+
 async def ev(pg, js): return await pg.evaluate(js)
 async def st(pg): return await ev(pg, 'JSON.parse(JSON.stringify(Tama.Game.state))')
 async def mode(pg): return await ev(pg, 'Tama.Game.ui.mode')
@@ -79,7 +85,10 @@ async def fight_by_tapping(pages, shot=None, max_s=90):
             if info is None: continue
             busy = True
             if info['p'] == 'choose':
-                await tap_lcd(pg, 24, random.choice([3, 19]), wait=150)
+                try: await pg.wait_for_function("Tama.Game.zonePoint('hi') || !Tama.Game.ui.battle || Tama.Game.ui.battle.phase!=='choose'", timeout=3000)
+                except Exception: continue
+                if not await ev(pg, "!!Tama.Game.zonePoint('hi')"): continue
+                await tap_zone(pg, random.choice(['hi', 'lo']), wait=150)
                 await pg.wait_for_function("!Tama.Game.ui.battle || Tama.Game.ui.battle.phase!=='choose'", timeout=3000)
             elif shot and not shot_done and info['p'] == 'anim' and pg is pages[0]:
                 await pg.wait_for_timeout(420); await pg.screenshot(path=shot); shot_done = True
@@ -112,9 +121,9 @@ async def main():
 
         h0 = (await st(pg))['hunger']
         await tap_icon(pg, 'feed'); check(await mode(pg) == 'feedMenu', 'tapping FEED icon opens the meal/snack screen')
-        await tap_lcd(pg, 24, 5); await idle(pg)
+        await tap_zone(pg, 'opt0'); await idle(pg)
         check((await st(pg))['hunger'] == h0 + 1, 'tapping MEAL feeds a meal')
-        await tap_icon(pg, 'feed'); await tap_lcd(pg, 24, 18); await idle(pg)
+        await tap_icon(pg, 'feed'); await tap_zone(pg, 'opt1'); await idle(pg)
         check((await st(pg))['snacks'] == 1, 'tapping SNACK gives a snack')
         await tap_icon(pg, 'feed'); await tap_icon(pg, 'back')
         check(await mode(pg) == 'main', 'back arrow leaves the feed screen')
@@ -122,20 +131,22 @@ async def main():
         await tap_icon(pg, 'play'); check(await mode(pg) == 'play', 'PLAY icon starts the left/right game')
         for i in range(5):
             await pg.wait_for_function("Tama.Game.ui.play && Tama.Game.ui.play.phase==='wait'", timeout=5000)
-            await tap_lcd(pg, 4 if i % 2 else 44, 14, wait=50)
+            await tap_zone(pg, 'left' if i % 2 else 'right', wait=50)
             await pg.wait_for_function("!Tama.Game.ui.play || Tama.Game.ui.play.phase!=='wait'", timeout=3000)
         await pg.wait_for_function("Tama.Game.ui.mode==='main'", timeout=8000)
         check((await st(pg))['plays'] == 1, 'play game completed by tapping')
 
         await tap_icon(pg, 'status'); check(await mode(pg) == 'status', 'STATUS icon opens status')
-        await tap_lcd(pg, 24, 12); await pg.wait_for_timeout(200)
+        await pg.wait_for_timeout(200)
         await pg.screenshot(path=f'{SHOTS}/03-phone-status-overlay.png')
+        await tap_zone(pg, 'status'); await pg.wait_for_timeout(200)
+        await pg.screenshot(path=f'{SHOTS}/03b-phone-status-hunger.png')
         await tap_icon(pg, 'back'); await tap_icon(pg, 'status')
         pages = []
         for _ in range(5):
-            pages.append(await ev(pg, 'Tama.Game.ui.page')); await tap_lcd(pg, 24, 12)
+            pages.append(await ev(pg, 'Tama.Game.ui.page')); await tap_zone(pg, 'status')
         check(pages == [0, 1, 2, 3, 4] and await mode(pg) == 'main', f'tapping the screen pages through status {pages}')
-        await tap_icon(pg, 'status'); await tap_lcd(pg, 24, 12); await tap_icon(pg, 'back')
+        await tap_icon(pg, 'status'); await tap_zone(pg, 'status'); await tap_icon(pg, 'back')
         check(await mode(pg) == 'main', 'back arrow exits status')
 
         await ev(pg, "var s=Tama.Game.state; s.poops=[{age:0,counted:false},{age:0,counted:false}]; Tama.Pet.makeSick(s); s.doses=1;")
@@ -145,16 +156,16 @@ async def main():
         await tap_icon(pg, 'discipline'); await idle(pg); check((await st(pg))['discipline'] == 25, 'DISCIPLINE icon scolds a fake call')
         await ev(pg, "var s=Tama.Game.state; s.ageMs=Math.floor(s.ageMs/Tama.CONFIG.T.DAY)*Tama.CONFIG.T.DAY+Tama.CONFIG.T.DAY*Tama.CONFIG.T.NIGHT_FRAC+10")
         await pg.wait_for_timeout(300)
-        await tap_icon(pg, 'light'); await tap_lcd(pg, 24, 18)
+        await tap_icon(pg, 'light'); await tap_zone(pg, 'opt1')
         s = await st(pg); check(s['asleep'] and s['lightsOff'], 'LIGHT icon -> OFF turns lights off while asleep')
         check(await ev(pg, "document.body.dataset.env") == 'night', 'lights off switches the meadow to the night sky')
         await pg.wait_for_timeout(700); await pg.screenshot(path=f'{SHOTS}/02-phone-night.png')
         await ev(pg, "Tama.Game.state.ageMs=20000"); await pg.wait_for_timeout(300)
 
-        x = await ev(pg, 'Tama.Game.ui.pet.x'); await tap_lcd(pg, x + 3, 20)
+        await tap_zone(pg, 'pet')
         check(await ev(pg, "Tama.Game.ui.petted > performance.now()"), 'tapping the pet makes it react')
 
-        await make_pet(pg, 'mochi', 'PIPO', "s.poops=[{age:0,counted:false}];")
+        await make_pet(pg, 'scrapper', 'PIPO', "s.poops=[{age:0,counted:false}];")
         await ev(pg, "var u=Tama.Game.ui; u.pet.x=10; u.pet.move='hop'; u.emote='heart'; u.emoteUntil=performance.now()+1e9; u.nextThink=performance.now()+1e9;")
         await pg.wait_for_timeout(400); await pg.screenshot(path=f'{SHOTS}/01-phone-home-day.png')
         check(await ev(pg, "document.body.dataset.env") == 'day', 'daytime meadow')
@@ -163,16 +174,16 @@ async def main():
         await tap_icon(pg, 'battle'); check(await mode(pg) == 'battleMenu', 'BATTLE icon opens RANDOM/FRIEND/CPU menu')
         await pg.wait_for_timeout(200); await pg.screenshot(path=f'{SHOTS}/05-phone-battle-menu.png')
         b0 = (await st(pg))['battles']
-        await tap_lcd(pg, 24, 23)
+        await tap_zone(pg, 'opt2')
         check(await ev(pg, "Tama.Game.ui.battle && Tama.Game.ui.battle.kind") == 'cpu', 'CPU option starts a computer battle')
         check(await fight_by_tapping([pg]), 'CPU battle played to the end by tapping HI/LO')
         check((await st(pg))['battles'] == b0 + 1, 'CPU battle recorded')
 
         code = await ev(pg, "Tama.Battle.encode({name:'RIVAL',formId:'kingleo',training:9,wins:7,battles:9,weight:33})")
-        await tap_icon(pg, 'battle'); await tap_lcd(pg, 24, 12)
+        await tap_icon(pg, 'battle'); await tap_zone(pg, 'opt1')
         check(await ev(pg, "!document.getElementById('linkPanel').hidden"), 'FRIEND option opens the friend-code sheet')
         my = await pg.inner_text('#myCode')
-        check(await ev(pg, f"(Tama.Battle.decode({json.dumps(my)})||{{}}).formId") == 'mochi', 'sheet shows own code with species')
+        check(await ev(pg, f"(Tama.Battle.decode({json.dumps(my)})||{{}}).formId") == 'scrapper', 'sheet shows own code with species')
         await pg.fill('#friendCode', 'TP-nonsense'); await pg.locator('#linkFight').tap()
         check('look right' in await pg.inner_text('#linkError'), 'bad friend code shows an error')
         await pg.fill('#friendCode', code); await pg.wait_for_timeout(100)
@@ -186,9 +197,9 @@ async def main():
 
         await ev(pg, "var s=Tama.Game.state; s.hunger=0; s.hungerZeroMs=Tama.CONFIG.T.STARVE_DEATH-1200")
         await pg.wait_for_function("Tama.Game.state.dead", timeout=5000); await pg.wait_for_timeout(400)
-        await tap_lcd(pg, 24, 12); check(await mode(pg) == 'deadConfirm', 'tapping the death screen asks NEW EGG?')
+        await tap_zone(pg, 'dead'); check(await mode(pg) == 'deadConfirm', 'tapping the death screen asks NEW EGG?')
         await tap_icon(pg, 'back'); check(await mode(pg) == 'main' and (await st(pg))['dead'], 'back from NEW EGG? returns to the grave')
-        await tap_lcd(pg, 24, 12); await tap_lcd(pg, 24, 16)
+        await tap_zone(pg, 'dead'); await tap_zone(pg, 'yes')
         s = await st(pg); check(s['stage'] == 'egg' and not s['dead'], 'tapping YES starts a new egg')
         await ctx.close()
 
@@ -199,17 +210,9 @@ async def main():
         await pg.wait_for_timeout(400); await pg.screenshot(path=f'{SHOTS}/09-desktop-home.png')
         cov = await ev(pg, "(function(){var r=document.getElementById('scene').getBoundingClientRect(); return [r.left, r.top, r.right, r.bottom]})()")
         check(cov[0] <= 0 and cov[1] <= 0 and cov[2] >= 800 and cov[3] >= 900, 'desktop: scene fills the window')
-        pet = await ev(pg, "(function(){var a=Tama.Game.stageToClient(0,0), b=Tama.Game.stageToClient(48,24); return [a.y, b.y]})()")
+        pet = await ev(pg, "(function(){var a=Tama.Game.stageToClient(0,0), b=Tama.Game.stageToClient(96,48); return [a.y, b.y]})()")
         check(pet[0] > 64 and pet[1] < 900 - 64, 'desktop: stage sits between the HUD bars')
         await tap_icon(pg, 'status'); check(await mode(pg) == 'status', 'desktop: mouse click on icons works')
-        tiles = []
-        for fid in ['kingleo', 'starla', 'chubbo', 'ghoulie', 'mimiko', 'drakon']:
-            await make_pet(pg, fid, 'PIX')
-            await ev(pg, "var u=Tama.Game.ui; u.pet.x=16; u.pet.move='stay'; u.nextThink=performance.now()+1e9; u.emote=null;")
-            await pg.wait_for_timeout(500)
-            a = await ev(pg, "Tama.Game.stageToClient(-4,-10)"); b2 = await ev(pg, "Tama.Game.stageToClient(52,27)")
-            path = f'/tmp/tile_{fid}.png'
-            await pg.screenshot(path=path, clip={'x': a['x'], 'y': a['y'], 'width': b2['x'] - a['x'], 'height': b2['y'] - a['y']}); tiles.append((fid, path))
         forms = set()
         for v in [dict(careMistakes=1, training=10, battles=8, wins=7, discipline=25, meals=20, snacks=5, weight=30),
                   dict(careMistakes=1, training=2, battles=0, wins=0, discipline=100, meals=20, snacks=4, weight=25),
@@ -224,10 +227,10 @@ async def main():
         await fresh(A); await fresh(B)
         await make_pet(A, 'nekoru', 'ALICE'); await make_pet(B, 'scrapper', 'BOB')
         sa0, sb0 = await st(A), await st(B)
-        await tap_icon(A, 'battle'); await tap_lcd(A, 24, 1)
+        await tap_icon(A, 'battle'); await tap_zone(A, 'opt0')
         check(await mode(A) == 'search', 'RANDOM starts searching')
         await A.wait_for_timeout(1300); await A.screenshot(path=f'{SHOTS}/06-phone-searching.png')
-        await tap_icon(B, 'battle'); await tap_lcd(B, 24, 1)
+        await tap_icon(B, 'battle'); await tap_zone(B, 'opt0')
         await A.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.kind==='online'", timeout=6000)
         await B.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.kind==='online'", timeout=6000)
         check(True, 'two phones matched online')
@@ -238,8 +241,9 @@ async def main():
         await B.wait_for_function("Tama.Game.ui.battle.phase==='choose'", timeout=8000)
         roles = [await ev(A, 'Tama.Game.ui.battle.role'), await ev(B, 'Tama.Game.ui.battle.role')]
         check(sorted(roles) == ['atk', 'def'], f'server assigns attacker/defender roles {roles}')
+        await A.wait_for_timeout(800)
         await A.screenshot(path=f'{SHOTS}/04-phone-online-battle.png')
-        check(await ev(A, 'document.body.dataset.env') == 'arena', 'battles use the arena background')
+        check(await ev(A, 'document.body.dataset.env') == 'battle', 'battles use the Gen-3 battle field')
         ok = await fight_by_tapping([A, B], shot=f'{SHOTS}/04b-phone-online-battle-hit.png')
         check(ok, 'online battle finished (both players tapping)')
         sa, sb = await st(A), await st(B)
@@ -276,13 +280,13 @@ async def main():
         })""")
         check(res['tooYoung'] == 'form does not match age', f"server rejects a secret form on a young pet ({res['tooYoung']})")
         check(res['badCounters'] == 'more wins than battles', f"server rejects impossible counters ({res['badCounters']})")
-        check(res['hp'] == 5, f"client-sent hp:999 ignored, server uses KINGLEO's own HP ({res['hp']})")
+        check(res['hp'] == 5, f"client-sent hp:999 ignored, server uses KAISERON's (kingleo) own HP ({res['hp']})")
         check(res['ignored'], 'forged results / wrong-turn / invalid moves are ignored')
         check(res['dmg'] <= 3, f"damage computed by server ({res['dmg']}), hp now {res['hpAfter']}")
 
         # ================= 5. fallback: nobody else online =================
         await make_pet(A, 'nekoru', 'ALICE')
-        await tap_icon(A, 'battle'); await tap_lcd(A, 24, 1)
+        await tap_icon(A, 'battle'); await tap_zone(A, 'opt0')
         t0 = time.time()
         await A.wait_for_function("Tama.Game.ui.fallbackReason==='nomatch'", timeout=20000)
         check(10 <= time.time() - t0 <= 16, f'no opponent -> gives up after ~12 s ({time.time()-t0:.1f}s)')
@@ -297,7 +301,7 @@ async def main():
         static = start_static()
         ctx, pg = await new_page(browser, PHONE, 'static')
         await fresh(pg); await make_pet(pg, 'blobbo', 'SOLO')
-        await tap_icon(pg, 'battle'); await tap_lcd(pg, 24, 1)
+        await tap_icon(pg, 'battle'); await tap_zone(pg, 'opt0')
         await pg.wait_for_function("Tama.Game.ui.fallbackReason==='offline'", timeout=8000)
         await pg.wait_for_timeout(900)
         await pg.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.kind==='cpu'", timeout=5000)
@@ -309,21 +313,36 @@ async def main():
         ctx, pg = await new_page(browser, PHONE, 'file')
         url = 'file://' + os.path.join(ROOT, 'index.html')
         await fresh(pg, url); await make_pet(pg, 'blobbo', 'FILE')
-        await tap_icon(pg, 'battle'); await tap_lcd(pg, 24, 1)
+        await tap_icon(pg, 'battle'); await tap_zone(pg, 'opt0')
         await pg.wait_for_function("Tama.Game.ui.fallbackReason==='offline'", timeout=6000)
         await pg.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.kind==='cpu'", timeout=5000)
         check(True, 'file:// -> RANDOM falls back to CPU')
         await ctx.close()
 
-        # ================= compose adult-forms sheet =================
-        pg = await browser.new_page(viewport={'width': 800, 'height': 900})
-        cells = ''.join(f'<figure><img src="data:image/png;base64,{base64.b64encode(open(path,"rb").read()).decode()}"><figcaption>{fid.upper()}</figcaption></figure>' for fid, path in tiles)
-        await pg.set_content(f'''<html><body style="margin:0;background:linear-gradient(160deg,#bff0e8,#d9ecff 45%,#ffe1f0);font-family:Trebuchet MS,sans-serif">
-        <h1 style="text-align:center;color:#9c1465;margin:22px 0 6px;letter-spacing:2px">TAMA·PIX — adult & secret forms</h1>
-        <p style="text-align:center;color:#8a6a7e;margin:0 0 12px">KINGLEO (battler) · STARLA (great care) · CHUBBO (snacks) · GHOULIE (neglect) · MIMIKO · DRAKON (secret)</p>
-        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:14px;padding:0 24px 24px">{cells}</div>
-        <style>figure{{margin:0;display:flex;flex-direction:column;align-items:center;background:#2b1d2e;padding:6px 6px 4px}} img{{width:350px;image-rendering:pixelated}} figcaption{{color:#fff;font-weight:bold;letter-spacing:2px;margin-top:4px}}</style></body></html>''')
-        await pg.wait_for_timeout(300); await pg.screenshot(path=f'{SHOTS}/04-adult-forms.png', full_page=True)
+        # ================= adult & secret forms gallery (rendered in-game, phone scale) =================
+        ctx, pg = await new_page(browser, PHONE, 'gallery')
+        await fresh(pg, 'file://' + os.path.join(ROOT, 'index.html')); await pg.add_style_tag(content='.bar{display:none !important}')
+        tiles = []
+        for fid in ['kingleo', 'rokkun', 'starla', 'mimiko', 'chubbo', 'ghoulie', 'oyaji', 'drakon', 'seraphi']:
+            await make_pet(pg, fid, 'PIX')
+            await ev(pg, "var u=Tama.Game.ui, w=Tama.Game.scene.size(Tama.Game.state.formId).w; u.pet.x=Math.round((96-w)/2); u.pet.move='stay'; u.nextThink=performance.now()+1e9; u.emote=null;")
+            await pg.wait_for_timeout(350)
+            a = await ev(pg, "Tama.Game.stageToClient(22,2)"); b2 = await ev(pg, "Tama.Game.stageToClient(74,50)")
+            path = f'/tmp/tile_{fid}.png'
+            await pg.screenshot(path=path, clip={'x': a['x'], 'y': a['y'], 'width': b2['x'] - a['x'], 'height': b2['y'] - a['y']})
+            info = await ev(pg, f"({{n:Tama.FORMS['{fid}'].name, d:Tama.FORMS['{fid}'].desc, s:Tama.FORMS['{fid}'].stage}})")
+            tiles.append((info, path))
+        await ctx.close()
+        pg = await browser.new_page(viewport={'width': 390, 'height': 844}, device_scale_factor=2)
+        cells = ''.join(f'<figure><img src="data:image/png;base64,{base64.b64encode(open(path,"rb").read()).decode()}"><figcaption><b>{i["n"]}</b><span>{i["d"]}</span></figcaption></figure>' for i, path in tiles)
+        await pg.set_content(f'''<html><body style="margin:0;background:#11161f;font-family:ui-monospace,Menlo,Consolas,monospace;color:#e6ebf2">
+        <h1 style="text-align:center;color:#e0ad48;margin:16px 0 2px;font-size:17px;letter-spacing:3px">TAMA·PIX</h1>
+        <p style="text-align:center;color:#8e9bb0;margin:0 0 12px;font-size:12px">7 adult forms + 2 secret forms</p>
+        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;padding:0 12px 16px">{cells}</div>
+        <style>figure{{margin:0;display:flex;flex-direction:column;background:#161c28;border:1px solid #8d9db5;box-shadow:0 0 0 1px #0a0d13;border-radius:3px;overflow:hidden}}
+        img{{width:100%;image-rendering:pixelated;display:block}} figcaption{{padding:6px 8px 8px;display:flex;flex-direction:column;gap:2px}}
+        b{{letter-spacing:2px;font-size:13px}} span{{color:#8e9bb0;font-size:10.5px}}</style></body></html>''')
+        await pg.wait_for_timeout(300); await pg.screenshot(path=f'{SHOTS}/08-adult-forms-gallery.png', full_page=True)
         await browser.close()
     stop(node)
     print('\nconsole errors/warnings:', errors)
