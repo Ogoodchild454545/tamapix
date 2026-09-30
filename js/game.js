@@ -33,11 +33,11 @@
 
   // ---------------------------------------------------------------- helpers
   const now = () => performance.now();
-  const petKey = (id) => (T.Monsters.has(id || state.formId) ? (id || state.formId) : 'pixbit');
+  const petKey = (id) => (T.Monsters.has(id || state.formId) ? (id || state.formId) : 'blob');
   const sz = (k) => S.size(k);
   const blink = (t, ms) => Math.floor(t / (ms || 400)) % 2 === 0;
   const groundY = (k) => FOOT - sz(k).h + 1;
-  const formName = (id) => (T.FORMS[id] || T.FORMS.pixbit).name;
+  const formName = (id) => (T.FORMS[id] || T.FORMS.blob).name;
   const poopSlot = (i) => [W - 12 - i * 11, FOOT - 6];
   function rightLimit() { return W - 2 - Math.min(4, state.poops.length) * 11; }
 
@@ -181,7 +181,7 @@
   const BATTLE_OPTS = () => [
     { label: 'RANDOM ONLINE', icon: null, fn: startSearch },
     { label: 'FRIEND CODE', icon: null, fn: openLinkPanel },
-    { label: 'VS COMPUTER', icon: null, fn: () => { back(); startLocalBattle(T.Battle.cpuCard(state.stage), 'cpu'); } }];
+    { label: 'VS COMPUTER', icon: null, fn: () => { back(); startLocalBattle(T.Battle.cpuCard(state.stage, Pet.level(state)), 'cpu'); } }];
 
   function feed(snack) { back(); eatAnim(snack ? 'berry' : 'meat', snack ? Pet.feedSnack(state) : Pet.feedMeal(state)); }
   function setLights(on) { Pet.setLights(state, on); A.sfx('ok'); back(); }
@@ -189,10 +189,23 @@
   function pips(x, y, n, max, col) {
     for (let i = 0; i < max; i++) { S.rect(x + i * 14, y, 12, 6, UI.edge); S.rect(x + i * 14 + 1, y + 1, 10, 4, i < n ? col : '#343b48'); }
   }
+  /** "1d 4h" / "3h 12m" / "25m" / "<1m" for a duration in REAL ms. */
+  function fmtDur(ms) {
+    const m = Math.max(0, Math.floor(ms / 60000)), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60;
+    if (d) return d + 'd ' + h + 'h';
+    if (h) return h + 'h ' + mm + 'm';
+    return mm ? mm + 'm' : '<1m';
+  }
+  function evolveLine(s) {
+    const left = Pet.evolvesIn(s);
+    if (left == null) return T.FORMS[s.formId].secret ? 'Secret final form' : 'Final form';
+    if (left <= 0) return s.asleep ? 'Evolves at dawn' : 'Evolving...';
+    return 'Evolves in ' + fmtDur(left / C.SPEED);
+  }
   function drawStatus(t) {
-    const s = state, f = T.FORMS[s.formId], card = T.Battle.card(s);
+    const s = state, f = T.FORMS[s.formId];
     drawMain(t, true); dim();
-    const x = 4, y = -44, w = 88, h = 92;
+    const x = 4, y = -56, w = 88, h = 104;
     S.panel(x, y, w, h);
     const titles = ['PROFILE', 'HUNGER', 'MOOD', 'DISCIPLINE', 'RECORD'];
     S.text(titles[ui.page], x + 7, y + 6, UI.accent);
@@ -201,34 +214,43 @@
     const cx = x + 7, cy = y + 22;
     switch (ui.page) {
       case 0: {
-        const k = petKey(), a = sz(k);
-        S.art(k, x + w - a.w - 8, y + h - a.h - 14, { frame: S.frame });
+        const k = petKey(), a = sz(k), L = Pet.level(s), X = T.Battle;
+        S.art(k, x + w - a.w - 5, y + 74 - a.h, { frame: S.frame });
         S.text(s.name, cx, cy, UI.text);
         S.text(f.name, cx, cy + 10, UI.accent);
-        S.text('Lv ' + T.Battle.level(card), cx, cy + 20, UI.text);
-        S.text('Age ' + Math.floor(s.ageMs / C.T.DAY), cx, cy + 30, UI.dim);
-        S.text('Wt ' + s.weight, cx, cy + 40, UI.dim);
+        S.text('Lv ' + L, cx, cy + 22, UI.text);
+        const lo = X.xpFor(L), hi = X.xpFor(L + 1), pr = L >= X.XP.MAX_LEVEL ? 1 : (s.xp - lo) / Math.max(1, hi - lo);
+        S.rect(cx, cy + 31, 34, 4, UI.edge); S.rect(cx + 1, cy + 32, 32, 2, '#343b48'); S.rect(cx + 1, cy + 32, Math.round(32 * U.clamp(pr, 0, 1)), 2, UI.blue);
+        S.text('XP ' + s.xp, cx, cy + 37, UI.dim);
+        S.text('Age ' + fmtDur(s.ageMs), cx, cy + 47, UI.dim);
+        S.rect(x + 5, y + 78, w - 10, 1, UI.inner);
+        S.text(evolveLine(s), cx, y + 83, Pet.evolvesIn(s) == null ? UI.dim : UI.text);
         break;
       }
-      case 1: S.text('Fullness', cx, cy, UI.dim); pips(cx, cy + 12, s.hunger, 4, UI.accent); S.text(s.hunger ? (s.hunger >= 3 ? 'Well fed.' : 'Could eat.') : 'Starving!', cx, cy + 26, UI.text); break;
+      case 1: S.text('Fullness', cx, cy, UI.dim); pips(cx, cy + 12, s.hunger, 4, UI.accent); S.text(s.hunger ? (s.hunger >= 3 ? 'Well fed.' : 'Could eat.') : 'Starving!', cx, cy + 26, UI.text); S.text('Wt ' + s.weight, cx, cy + 40, UI.dim); break;
       case 2: S.text('Spirit', cx, cy, UI.dim); pips(cx, cy + 12, s.happy, 4, UI.blue); S.text(s.happy ? (s.happy >= 3 ? 'Fired up.' : 'Restless.') : 'Miserable.', cx, cy + 26, UI.text); break;
       case 3: {
         S.text('Obedience', cx, cy, UI.dim);
         S.rect(cx, cy + 12, 72, 7, UI.edge); S.rect(cx + 1, cy + 13, 70, 5, '#343b48');
         S.rect(cx + 1, cy + 13, Math.round(70 * s.discipline / 100), 5, UI.green);
         S.text(s.discipline + '%', cx, cy + 26, UI.text);
+        S.text('Care mistakes ' + s.careMistakes, cx, cy + 40, UI.dim);
         break;
       }
-      case 4:
+      case 4: {
+        const st = s.st || {};
         S.text('Wins ' + s.wins + '  Losses ' + (s.battles - s.wins), cx, cy, UI.text);
-        S.text('Training ' + s.training, cx, cy + 12, UI.text);
-        if (f.special) S.text('Special: ' + f.special.name, cx, cy + 24, UI.dim);
-        if (f.move) S.text('Move: ' + f.move, cx, cy + 34, UI.dim);
+        S.text('Training ' + s.training, cx, cy + 10, UI.text);
+        S.text('This stage: W' + (st.wins || 0) + ' L' + (st.losses || 0), cx, cy + 22, UI.dim);
+        S.text('Trained ' + (st.training || 0) + '  Mistakes ' + (st.careMistakes || 0), cx, cy + 32, UI.dim);
+        if (f.move) S.text('Move: ' + f.move, cx, cy + 44, UI.dim);
+        if (f.special) S.text('Special: ' + f.special.name, cx, cy + 54, UI.dim);
         break;
+      }
     }
     for (let i = 0; i < STATUS_PAGES; i++) S.rect(x + w / 2 - 12 + i * 6, y + h - 8, 3, 3, i === ui.page ? UI.accent : '#4a5366');
     if (blink(t, 500)) S.text('>', x + w - 10, y + h - 11, UI.accent);
-    zone(-20, -60, W + 40, H + 80, nextStatusPage, { x: x + w - 14, y: y + h - 14, w: 10, h: 10 }, 'status');
+    zone(-20, -80, W + 40, H + 100, nextStatusPage, { x: x + w - 14, y: y + h - 14, w: 10, h: 10 }, 'status');
   }
   function nextStatusPage() { ui.page++; if (ui.page >= STATUS_PAGES) back(); }
 
@@ -374,13 +396,14 @@
       drawPet(key, x, groundY(key) - (P.hit && blink(t, 200) ? 2 : 0), P.dir > 0);
       if (el > 300) drawEmote(P.hit ? 'heart' : 'sweat', x, groundY(key), b.w);
       if (el > 1300) {
-        if (P.round >= 5) { P.phase = 'done'; P.t0 = t; const r = Pet.playDone(state, P.score); A.sfx(r === 'win' ? 'win' : 'lose'); P.result = r; }
+        if (P.round >= 5) { P.phase = 'done'; P.t0 = t; const r = Pet.playDone(state, P.score); A.sfx(r.result === 'win' ? 'win' : 'lose'); P.result = r.result; P.gain = r; }
         else { P.round++; P.phase = 'wait'; }
       }
     } else {
       drawPet(key, cx, groundY(key) - (P.result === 'win' && blink(t, 200) ? 2 : 0), false);
-      S.label(P.result === 'win' ? 'Good session!' : 'Sloppy today...', -10, P.result === 'win' ? UI.green : UI.red);
-      if (t - P.t0 > 1800) { ui.play = null; back(); }
+      S.label(P.result === 'win' ? 'Good session!' : 'Sloppy today...', -18, P.result === 'win' ? UI.green : UI.red);
+      S.label('+' + P.gain.xp + ' XP' + (P.gain.levelUp ? '   Lv ' + P.gain.level + '!' : ''), -2, P.gain.levelUp ? UI.accent : UI.text);
+      if (t - P.t0 > 2200) { ui.play = null; back(); }
     }
   }
 
@@ -434,7 +457,10 @@
   }
   function finishBattle(B, won, reason) {
     B.phase = 'end'; B.won = won; B.reason = reason; B.t0 = now();
-    if (reason !== 'lost') { Pet.battleDone(state, won); A.sfx(won ? 'win' : 'lose'); } else A.sfx('no');
+    if (reason !== 'lost') {
+      B.gain = Pet.battleDone(state, won ? 'win' : reason === 'fled' ? 'fled' : 'loss', T.Battle.level(B.opp.card));
+      A.sfx(won ? 'win' : 'lose');
+    } else A.sfx('no');
   }
   function battleStep(t) {
     const B = ui.battle;
@@ -447,15 +473,17 @@
       else if (e.type === 'result') { B.phase = 'anim'; B.cur = e; B.t0 = t; B.from = { me: B.me.hp, opp: B.opp.hp }; A.sfx('shoot'); }
       else if (e.type === 'end') finishBattle(B, e.won, e.reason);
     }
-    if (B.phase === 'end' && t - B.t0 > 3000) { ui.battle = null; back(); }
+    if (B.phase === 'end' && t - B.t0 > 3400) { ui.battle = null; back(); }
   }
   function battleLayout() {
     const b = S.bounds(), top = b.top, tb = b.bottom - 40;
     return { top, tb, pcx: 21, pcy: tb - 6, ocx: 70, ocy: top + Math.max(52, Math.min(70, Math.round((tb - top) * 0.5))) };
   }
-  function plate(x, y, w, f, hp, nums) {
-    S.panel(x, y, w, 30);
+  function plate(x, y, w, f, hp, nums, right) {
     const name = formName(f.card.formId), lv = 'Lv' + T.Battle.level(f.card);
+    const need = S.textW(name) + 10;
+    if (need > w) { if (right) x -= need - w; w = need; }
+    S.panel(x, y, w, 30);
     S.text(name, x + 5, y + 4, UI.text);
     S.hpBar(x + 5, y + 13, w - 10, hp, f.max);
     S.text(lv, x + 5, y + 21, UI.dim);
@@ -536,7 +564,8 @@
       const k = U.clamp(el / 600, 0, 1);
       if (B.reason !== 'lost') { if (B.won) { oppAlpha = 1 - k; opY += Math.round(k * 10); } else if (B.reason !== 'fled') { meAlpha = 1 - k; myY += Math.round(k * 10); } }
       msg = msgLines(B.reason === 'lost' ? 'The link was lost.' : B.reason === 'fled' && !B.won ? 'Got away safely!' :
-        B.won ? (B.reason === 'ko' ? foe + ' fainted! You win!' : 'The rival fled. You win!') : myName + ' fainted... You lost.');
+        B.won ? (B.reason === 'ko' ? foe + ' fainted! You win!' : 'The rival fled. You win!') : myName + ' fainted... You lost.').slice(0, 2);
+      if (B.gain && B.gain.xp && el > 700) msg.push('Gained ' + B.gain.xp + ' XP.' + (B.gain.levelUp ? ' Lv ' + B.gain.level + '!' : ''));
     }
 
     // platforms + monsters (+ shake)
@@ -549,7 +578,7 @@
     S.ctx.restore();
     if (plates) {
       plate(2, L.top + 3, 54, B.opp, hpOpp, false);
-      plate(W - 57, L.tb - 34, 56, B.me, hpMe, true);
+      plate(W - 57, L.tb - 34, 56, B.me, hpMe, true, true);
     }
     if (msg) textBox(L, msg);
   }
@@ -584,7 +613,7 @@
         back();
         const msg = why === 'nomatch' ? 'No rival found.' : why.startsWith('rejected') ? 'The server refused.' : 'Server offline.';
         A.sfx('no');
-        noticeAnim(msg, 'A wild monster appeared!', 2200, () => startLocalBattle(T.Battle.cpuCard(state.stage), 'cpu'));
+        noticeAnim(msg, 'A wild monster appeared!', 2200, () => startLocalBattle(T.Battle.cpuCard(state.stage, Pet.level(state)), 'cpu'));
       }
     });
   }
@@ -638,7 +667,7 @@
       case 'status': ui.mode = 'status'; ui.page = 0; break;
       case 'discipline': scoldAnim(Pet.scold(state)); break;
       case 'battle':
-        if (state.stage === 'baby' || state.sick) refuseAnim(null);
+        if (state.sick) refuseAnim(null);
         else { ui.mode = 'battleMenu'; ui.sub = 0; }
         break;
     }
@@ -682,8 +711,8 @@
     }
     if (!z) return;
     A.sfx('click');
-    const b = z.box || z;
-    ui.tapFx = { x: b.x, y: b.y, w: b.w, h: b.h, until: t + 110 };
+    // brief highlight only for real buttons/choices (never on the pet or full-screen tap areas)
+    ui.tapFx = z.box && z.id !== 'pet' ? { x: z.box.x, y: z.box.y, w: z.box.w, h: z.box.h, until: t + 110 } : null;
     ui.tapLock = t + 120;
     setTimeout(() => { z.fn(); render(); renderHUD(); }, 100);
   }
@@ -810,7 +839,7 @@
   // ---------------------------------------------------------------- loop
   function tick() {
     const real = Date.now(); const dt = real - lastReal; lastReal = real;
-    if (dt > 5000) handleEvents(Pet.simulate(state, Pet.offlineGameMs(dt)), true);
+    if (dt > 5000) handleEvents(Pet.simulate(state, dt * C.SPEED, null, { away: true }), true);
     else if (dt > 0) handleEvents(Pet.simulate(state, dt * C.SPEED), false);
     render(); renderHUD();
     if (real - lastSave > 5000) { lastSave = real; Pet.save(state); }
@@ -870,7 +899,7 @@
     state = Pet.load();
     if (state) {
       const away = Date.now() - (state.lastSaved || Date.now());
-      if (away > 2000) handleEvents(Pet.simulate(state, Pet.offlineGameMs(away)), true);
+      if (away > 2000) handleEvents(Pet.simulate(state, away * C.SPEED, null, { away: true }), true);
     } else state = Pet.create();
     lastReal = Date.now();
     bindInput(); updateMute(); fit();
@@ -896,7 +925,7 @@
       const b = z.box || z; return S.toClient(b.x + b.w / 2, b.y + b.h / 2);
     },
     resetUI() { ui = freshUI(); },
-    newEgg, evolveAnim, startLocalBattle, startSearch, render
+    newEgg, evolveAnim, startLocalBattle, startSearch, render, handleEvents
   };
 
   document.addEventListener('DOMContentLoaded', init);

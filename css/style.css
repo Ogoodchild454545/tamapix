@@ -21,7 +21,7 @@ body {
   user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
   overscroll-behavior: none;
 }
-#scene { position: fixed; left: 0; top: 0; display: block; image-rendering: pixelated; image-rendering: crisp-edges; cursor: pointer; touch-action: manipulation; }
+#scene { position: fixed; left: 0; top: 0; display: block; outline: none; -webkit-tap-highlight-color: transparent; image-rendering: pixelated; image-rendering: crisp-edges; cursor: pointer; touch-action: manipulation; }
 
 /* ---------- HUD bars ---------- */
 .bar {
@@ -45,7 +45,9 @@ body {
 .pbtn.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--edge), inset 0 0 0 1px rgba(224, 173, 72, .35); }
 .pbtn:disabled { cursor: default; }
 .pbtn:disabled .picon { opacity: .3; }
-.pbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pbtn:focus { outline: none; }
+.pbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }   /* keyboard focus only */
+@media (hover: none) { .pbtn:focus-visible { outline: none; } }                 /* touch: never a focus box */
 .pbtn.back .picon { opacity: .45; }
 .pbtn.back.ready { border-color: var(--accent); }
 .pbtn.back.ready .picon { opacity: 1; }
@@ -97,9 +99,26 @@ body {
 #debug fieldset input { width: 60px; }
 #debug #dbgSpeed { width: 60px; }
 #debug pre { white-space: pre-wrap; margin: 6px 0 0; color: #bcd; }
-#gallery { position: fixed; inset: 20px; z-index: 50; background: var(--panel); color: var(--text); border: 1px solid var(--border); padding: 14px; overflow: auto; }
-.gal-head { font-weight: bold; margin-bottom: 10px; display: flex; justify-content: space-between; }
-.gal-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; }
-.gal-cell { display: flex; flex-direction: column; align-items: center; font-size: 11px; background: var(--panel2); border: 1px solid #3a4558; padding: 8px; }
-.gal-cell canvas { width: 100px; image-rendering: pixelated; margin-bottom: 4px; }
-.gal-cell span { color: var(--dim); }
+#debug #dbgBranches div { margin: 1px 0; }
+#debug #dbgBranches .chosen { color: var(--accent); }
+#debug #dbgBranches .ok { color: #bcd; }
+#debug #dbgBranches .no { color: #6a7486; }
+#debug #dbgBranches small { color: #7d889a; }
+#debug #dbgPrev { width: 80px; height: 80px; image-rendering: pixelated; background: #30502a; }
+#debug #dbgPrevTxt { flex: 1; color: #bcd; }
+#gallery { position: fixed; inset: 12px; z-index: 50; background: #11161f; color: var(--text); border: 1px solid var(--border); padding: 12px; overflow: auto;
+  font-size: 11px; }
+.gal-head { font-weight: bold; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; color: var(--accent); letter-spacing: 1px; }
+.gal-head small { display: block; color: var(--dim); font-weight: normal; letter-spacing: 0; margin-top: 2px; }
+#gallery h4 { margin: 12px 0 6px; color: var(--dim); font-size: 11px; font-weight: normal; border-bottom: 1px solid #2a3344; padding-bottom: 3px; }
+#gallery i { font-style: normal; color: var(--dim); align-self: center; font-size: 16px; }
+.tree-root, .tree-line { display: flex; gap: 6px; align-items: stretch; margin-bottom: 8px; }
+.tree-line { padding-bottom: 8px; border-bottom: 1px dashed #263041; }
+.finals { display: flex; gap: 6px; flex: 1; }
+.gal-cell { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 2px; width: 104px; flex: 0 0 104px;
+  background: var(--panel2); border: 1px solid #3a4558; padding: 5px; border-radius: 2px; }
+.gal-cell.secret { border-color: var(--accent); }
+.gal-cell canvas { width: 84px; height: 84px; image-rendering: pixelated; }
+.gal-cell b { letter-spacing: 1px; font-size: 11px; }
+.gal-cell em { font-style: normal; color: var(--accent); font-size: 9.5px; line-height: 1.25; }
+.gal-cell span { color: var(--dim); font-size: 9.5px; line-height: 1.25; }

@@ -28,26 +28,33 @@ for (const f of ['config.js', 'evolution.js', 'battle.js']) {
   vm.runInContext(fs.readFileSync(path.join(ROOT, 'js', f), 'utf8'), sandbox, { filename: f });
 }
 const T = sandbox.window.Tama;
-const { FORMS, Battle, CONFIG } = T;
-const ENTRY_AGE = { child: CONFIG.T.CHILD_AT, teen: CONFIG.T.TEEN_AT, adult: CONFIG.T.ADULT_AT, secret: CONFIG.T.SECRET_AT };
+const { FORMS, Battle, CONFIG, Evolution } = T;
+const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 
-/** Plausibility checks for a pet a client wants to battle with. Returns [card, null] or [null, reason]. */
+/** Plausibility checks for a pet a client wants to battle with. Returns [card, null] or [null, reason].
+ *  Uses the shared rules: the form must be reachable at the claimed age (Evolution.entryAge: baby from hatching,
+ *  day-2 forms from 2 days, finals from 5 days), XP must be explainable by its trainings and battles. */
 function validate(card, ageMs) {
   if (!card || typeof card !== 'object') return [null, 'no pet'];
-  const f = FORMS[card.formId];
-  if (!f || !Object.prototype.hasOwnProperty.call(FORMS, card.formId)) return [null, 'unknown form'];
-  if (!ENTRY_AGE[f.stage]) return [null, 'too young to battle'];
+  const formId = own(T.LEGACY_FORMS, card.formId) ? T.LEGACY_FORMS[card.formId] : card.formId;
+  if (typeof formId !== 'string' || !own(FORMS, formId)) return [null, 'unknown form'];
+  const f = FORMS[formId], entry = Evolution.entryAge(formId);
+  if (entry == null) return [null, 'too young to battle'];
   const name = String(card.name || '');
   if (!/^[A-Z0-9]{1,8}$/.test(name)) return [null, 'bad name'];
   const int = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
-  if (!int(card.training, 0, 5000) || !int(card.battles, 0, 5000) || !int(card.wins, 0, 5000)) return [null, 'bad counters'];
+  const xp = card.xp == null ? 0 : card.xp;
+  if (!int(card.training, 0, 5000) || !int(card.battles, 0, 5000) || !int(card.wins, 0, 5000) || !int(xp, 0, 1e6)) return [null, 'bad counters'];
   if (card.wins > card.battles) return [null, 'more wins than battles'];
   if (!int(card.weight, CONFIG.MIN_WEIGHT[f.stage] || 1, 99)) return [null, 'implausible weight'];
-  if (typeof ageMs !== 'number' || !isFinite(ageMs) || ageMs < ENTRY_AGE[f.stage] || ageMs > 1e12) return [null, 'form does not match age'];
-  // each play/battle takes a few seconds of game time at the very least
+  if (typeof ageMs !== 'number' || !isFinite(ageMs) || ageMs < entry || ageMs > 1e12) return [null, 'form does not match age'];
+  // each training session / battle takes a few seconds at the very least
   if (card.training + card.battles > ageMs / 3000 + 20) return [null, 'too much training for its age'];
-  if (card.formId === 'drakon' && card.battles < 10) return [null, 'implausible secret form'];
-  return [{ name, formId: card.formId, training: card.training, wins: card.wins, battles: card.battles, weight: card.weight }, null];
+  // XP only comes from trainings (max 30 each) and battles (max 80 each)
+  const X = Battle.XP;
+  if (xp > card.training * (X.TRAIN_BASE + 5 * X.TRAIN_PER_HIT) + card.battles * X.WIN_MAX + 50) return [null, 'implausible XP'];
+  if (f.secret && card.battles < 15) return [null, 'implausible secret form'];
+  return [{ name, formId, xp, training: card.training, wins: card.wins, battles: card.battles, weight: card.weight }, null];
 }
 
 // ------------------------------------------------------------------ static files

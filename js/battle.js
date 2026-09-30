@@ -1,6 +1,9 @@
 /* TAMA-PIX — battles & friend codes.
  *
- * Battle data ("card") = { name, formId, training, wins, battles, weight }.
+ * Battle data ("card") = { name, formId, xp, training, wins, battles, weight }.
+ *
+ * Levels (1-50) come ONLY from XP, and XP only from training sessions and battles (see XP below). The level adds
+ * a little to every battle stat, so a trained monster beats an untrained one of the same species.
  * The card is what gets encoded into a friend code, so an opponent built from a code
  * shows the right species sprite, name and stats.
  *
@@ -14,26 +17,47 @@
   const U = T.util;
 
   const Battle = {
-    card(s) {
-      return { name: s.name, formId: s.formId, training: s.training, wins: s.wins, battles: s.battles, weight: s.weight };
+    // ---------- XP & levels ----------
+    XP: {
+      MAX_LEVEL: 50,
+      TRAIN_BASE: 10, TRAIN_PER_HIT: 4,             // a 5-round training session: 10 + 4 per hit (10-30 XP)
+      WIN: 40, LOSS: 15,                            // battles; fleeing gives nothing
+      WIN_PER_LEVEL: 6, LOSS_PER_LEVEL: 3,          // bonus per level the foe is above you (penalty if below)
+      WIN_MIN: 15, WIN_MAX: 80, LOSS_MIN: 5, LOSS_MAX: 35
     },
-    /** Display level (1-99) from stage, training and wins. */
-    level(card) {
-      const f = T.FORMS[card.formId] || {};
-      const base = { baby: 3, child: 9, teen: 17, adult: 28, secret: 42 }[f.stage] || 5;
-      return Math.min(99, base + Math.floor((card.training || 0) / 2) + Math.min(20, card.wins || 0));
+    /** Total XP needed to reach level L: 30, 70, 120, ... 630 (Lv10), 2280 (Lv20), 13230 (Lv50). */
+    xpFor(L) { L = Math.max(1, Math.min(this.XP.MAX_LEVEL, L | 0)); return 5 * (L - 1) * (L + 4); },
+    levelFromXp(xp) {
+      xp = Math.max(0, xp || 0);
+      let L = 1; while (L < this.XP.MAX_LEVEL && xp >= this.xpFor(L + 1)) L++;
+      return L;
+    },
+    level(card) { return this.levelFromXp(card && card.xp); },
+    trainXp(hits) { return this.XP.TRAIN_BASE + this.XP.TRAIN_PER_HIT * Math.max(0, Math.min(5, hits | 0)); },
+    /** XP for a finished battle. result: 'win' | 'loss' | 'fled'. */
+    battleXp(result, myLevel, foeLevel) {
+      const X = this.XP, d = (foeLevel || myLevel) - myLevel;
+      if (result === 'win') return U.clamp(X.WIN + d * X.WIN_PER_LEVEL, X.WIN_MIN, X.WIN_MAX);
+      if (result === 'loss') return U.clamp(X.LOSS + d * X.LOSS_PER_LEVEL, X.LOSS_MIN, X.LOSS_MAX);
+      return 0;
+    },
+
+    card(s) {
+      return { name: s.name, formId: s.formId, xp: s.xp | 0, training: s.training, wins: s.wins, battles: s.battles, weight: s.weight };
     },
     /** Public view of a fighter (what an opponent / the server sends). */
     view(f) { return { card: f.card, hp: f.hp, max: f.max, st: { hp: f.st.hp, pow: f.st.pow, def: f.st.def, spd: f.st.spd, special: f.st.special } }; },
+    /** Battle stats: species base + level bonus (+1 HP per 15 levels, +1 POW per 12, +1 DEF per 18, +1 SPD per 25). */
     statsFor(card) {
-      const f = T.FORMS[card.formId] || T.FORMS.pixbit;
+      const f = T.FORMS[card.formId] || T.FORMS.blob;
       const b = f.stats || { hp: 2, pow: 1, def: 1, spd: 1 };
-      const heavy = card.weight >= 45 ? 1 : 0;
+      const L = this.level(card);
+      const heavy = card.weight >= (T.CONFIG.MIN_WEIGHT[f.stage] || 5) + 20 ? 1 : 0;
       return {
-        hp: b.hp + heavy,
-        pow: b.pow + Math.min(2, Math.floor((card.training || 0) / 8)),
-        def: b.def + heavy,
-        spd: Math.max(1, b.spd + Math.min(1, Math.floor((card.wins || 0) / 5)) - heavy),
+        hp: b.hp + heavy + Math.floor(L / 15),
+        pow: b.pow + Math.floor(L / 12),
+        def: b.def + heavy + Math.floor(L / 18),
+        spd: Math.max(1, b.spd - heavy + Math.floor(L / 25)),
         special: f.special
       };
     },
@@ -42,12 +66,13 @@
       return { card, name: card.name, form: T.FORMS[card.formId], st, hp: st.hp, max: st.hp,
                turns: 0, guardNext: false, dodgeNext: false, absorbNext: false, stunned: false, lastDir: null };
     },
-    cpuCard(stage) {
-      const st = stage === 'secret' ? 'adult' : stage === 'baby' ? 'child' : stage;
+    /** A computer rival of the same stage, around your level (-2 .. +3). */
+    cpuCard(stage, myLevel) {
+      const st = stage === 'egg' ? 'baby' : stage;
       const pool = T.Evolution.formsByStage(st);
-      const lvl = { child: 4, teen: 10, adult: 18 }[st] || 6;
+      const lvl = U.clamp((myLevel || 1) + Math.floor(U.rand(-2, 4)), 1, this.XP.MAX_LEVEL);
       const battles = Math.floor(U.rand(0, lvl));
-      return { name: T.Pet.randomName(), formId: U.pick(pool), training: Math.floor(U.rand(0, lvl)),
+      return { name: T.Pet.randomName(), formId: U.pick(pool), xp: this.xpFor(lvl) + Math.floor(U.rand(0, 10)), training: Math.floor(U.rand(0, lvl * 2)),
                battles, wins: Math.floor(battles * U.rand(0.2, 0.8)), weight: T.CONFIG.MIN_WEIGHT[st] + Math.floor(U.rand(0, 12)) };
     },
 
@@ -102,7 +127,7 @@
     // ---------- friend codes ----------
     encode(card) {
       const safe = String(card.name).replace(/[^A-Z0-9]/gi, '').slice(0, 8).toUpperCase() || 'PAL';
-      const body = ['TP1', safe, card.formId, card.training | 0, card.wins | 0, card.battles | 0, card.weight | 0].join('|');
+      const body = ['TP2', safe, card.formId, card.training | 0, card.wins | 0, card.battles | 0, card.weight | 0, card.xp | 0].join('|');
       let h = 7; for (const ch of body) h = (h * 31 + ch.charCodeAt(0)) % 1296;
       return 'TP-' + btoa(body + '|' + h.toString(36)).replace(/=+$/, '');
     },
@@ -111,12 +136,15 @@
         code = String(code).trim().replace(/^TP-/i, '');
         const raw = atob(code + '==='.slice((code.length + 3) % 4));
         const parts = raw.split('|');
-        if (parts.length !== 8 || parts[0] !== 'TP1') return null;
-        const body = parts.slice(0, 7).join('|');
+        const n = parts[0] === 'TP2' ? 9 : parts[0] === 'TP1' ? 8 : 0;      // TP1 = old codes without XP
+        if (!n || parts.length !== n) return null;
+        const body = parts.slice(0, n - 1).join('|');
         let h = 7; for (const ch of body) h = (h * 31 + ch.charCodeAt(0)) % 1296;
-        if (h.toString(36) !== parts[7]) return null;
-        if (!T.FORMS[parts[2]] || parts[2] === 'egg') return null;
-        return { name: parts[1], formId: parts[2], training: +parts[3], wins: +parts[4], battles: +parts[5], weight: +parts[6] };
+        if (h.toString(36) !== parts[n - 1]) return null;
+        const formId = T.LEGACY_FORMS[parts[2]] || parts[2];
+        if (!Object.prototype.hasOwnProperty.call(T.FORMS, formId) || formId === 'egg') return null;
+        const xp = n === 9 ? +parts[7] : Math.min(20000, 12 * (+parts[3]) + 30 * (+parts[4]));
+        return { name: parts[1], formId, xp, training: +parts[3], wins: +parts[4], battles: +parts[5], weight: +parts[6] };
       } catch (e) { return null; }
     }
   };
