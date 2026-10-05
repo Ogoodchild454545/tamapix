@@ -9,7 +9,7 @@
   'use strict';
   const C = T.CONFIG, M = T.Monsters;
   const UI = {
-    panel: 'rgba(22, 28, 40, 0.94)', edge: '#0a0d13', border: '#8d9db5', inner: '#2b3549',
+    panel: '#161c28', edge: '#0a0d13', border: '#7a8aa3', inner: '#2b3549',
     text: '#e6ebf2', dim: '#8e9bb0', accent: '#e0ad48', red: '#d4524a', green: '#5cb86a', yellow: '#dcc043', blue: '#6f9fd8'
   };
   T.UI = UI;
@@ -366,24 +366,29 @@
     if (line) out.push(line);
     return out;
   };
-  /** Dark slate panel with a thin light border. accent: highlight border colour. */
+  /** Flat slate panel: fill + single 1px border (no double-edge chrome). accent: highlight border. */
   P.panel = function (x, y, w, h, accent, fill) {
     const g = this.ctx;
-    g.fillStyle = UI.edge; g.fillRect(x + 1, y, w - 2, h); g.fillRect(x, y + 1, w, h - 2);
-    g.fillStyle = fill || UI.panel; g.fillRect(x + 1, y + 1, w - 2, h - 2);
+    g.fillStyle = fill || UI.panel; g.fillRect(x, y, w, h);
     g.fillStyle = accent || UI.border;
-    g.fillRect(x + 2, y + 1, w - 4, 1); g.fillRect(x + 2, y + h - 2, w - 4, 1); g.fillRect(x + 1, y + 2, 1, h - 4); g.fillRect(x + w - 2, y + 2, 1, h - 4);
-    g.fillStyle = UI.inner; g.fillRect(x + 2, y + 2, w - 4, 1);
+    g.fillRect(x, y, w, 1); g.fillRect(x, y + h - 1, w, 1);
+    g.fillRect(x, y, 1, h); g.fillRect(x + w - 1, y, 1, h);
+  };
+  /** 1px rule used under titles / between rows. */
+  P.rule = function (x, y, w, c) { this.rect(x, y, w, 1, c || UI.inner); };
+  /** Vertically centre a 7px glyph string inside a box of height h. */
+  P.textMid = function (s, x, y, h, c) {
+    this.text(s, x, y + Math.floor((h - T.FONT_H) / 2), c);
   };
   P.label = function (s, y, c, cx) {
     const lines = this.wrap(s, this.W - 14), tw = Math.max(...lines.map(l => this.textW(l)));
     const w = tw + 8, x = cx != null ? Math.round(cx - w / 2) : Math.floor((this.W - w) / 2);
-    this.panel(x, y - 3, w, 13 + (lines.length - 1) * 9);
+    this.panel(x, y - 2, w, 11 + (lines.length - 1) * 9);
     lines.forEach((l, i) => this.text(l, x + 4 + Math.floor((tw - this.textW(l)) / 2), y + i * 9, c));
   };
   P.button = function (x, y, w, h, label, hi, color) {
     this.panel(x, y, w, h, hi ? UI.accent : null);
-    this.text(label, x + Math.floor((w - this.textW(label)) / 2), y + Math.floor((h - 6) / 2), color || (hi ? UI.accent : UI.text));
+    this.textMid(label, x + Math.floor((w - this.textW(label)) / 2), y, h, color || (hi ? UI.accent : UI.text));
   };
   /** HP bar: green > 50%, yellow > 20%, red otherwise. */
   P.hpBar = function (x, y, w, hp, max) {

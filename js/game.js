@@ -102,50 +102,75 @@
     const f = Math.round((w - 2) * U.clamp(frac, 0, 1)); if (f > 0) S.rect(x + 1, y + 1, f, 3, col);
   }
 
-  /** Stacked choices on dark panels. opts: [{label, icon, note, fn, id}]. */
+  /** Stacked choices: one flat card, clear labels + right notes. opts: [{label, icon, note, fn, id}]. */
   function drawOptions(opts, title) {
-    const n = opts.length, boxH = 15, gap = 4, w = 80, x = Math.floor((W - w) / 2);
-    const total = n * boxH + (n - 1) * gap, y0 = Math.round(H / 2 - total / 2) - 4 - (n > 3 ? 10 : 0);
-    if (title) S.label(title, y0 - 14, UI.accent);
+    const n = opts.length, rowH = 14, pad = 3, w = W - 8, x = 4;
+    const head = title ? 13 : 2, total = head + n * rowH + pad;
+    const y0 = Math.round(H / 2 - total / 2) - 2 - (n > 3 ? 8 : 0);
+    S.panel(x, y0, w, total);
+    if (title) {
+      S.textMid(title, x + 5, y0 + 1, head - 1, UI.accent);
+      S.rule(x + 4, y0 + head - 1, w - 8);
+    }
     ui.rows = opts;
     opts.forEach((o, i) => {
-      const y = y0 + i * (boxH + gap), hi = ui.lastInput === 'key' && ui.sub === i;
-      S.panel(x, y, w, boxH, hi ? UI.accent : null);
-      S.text(o.label, x + 6, y + 5, hi ? UI.accent : UI.text);
-      if (o.icon) { const a = sz(o.icon); S.art(o.icon, x + w - a.w - 4, y + Math.floor((boxH - a.h) / 2)); }
-      if (o.note) S.text(o.note, x + w - 5 - S.textW(o.note), y + 5, o.noteCol || UI.dim);
-      const zt = i === 0 ? y0 - 30 : y - Math.floor(gap / 2), zb = i === n - 1 ? H + 30 : y + boxH + Math.ceil(gap / 2);
-      zone(-20, zt, W + 40, zb - zt, o.fn, { x, y, w, h: boxH }, o.id || 'opt' + i);
+      const y = y0 + head + i * rowH, hi = ui.lastInput === 'key' && ui.sub === i;
+      if (hi) { S.rect(x + 1, y, w - 2, rowH, '#243044'); S.rect(x + 1, y + 2, 2, rowH - 4, UI.accent); }
+      const lx = x + 6, ly = y + Math.floor((rowH - T.FONT_H) / 2);
+      let rightW = 0;
+      if (o.icon) rightW = Math.max(rightW, sz(o.icon).w + 6);
+      if (o.note) rightW = Math.max(rightW, S.textW(o.note) + 3);
+      S.text(fitText(o.label, w - 12 - rightW), lx, ly, hi ? UI.accent : UI.text);
+      if (o.icon) { const a = sz(o.icon); S.art(o.icon, x + w - a.w - 4, y + Math.floor((rowH - a.h) / 2)); }
+      if (o.note) S.text(o.note, x + w - 5 - S.textW(o.note), ly, o.noteCol || UI.dim);
+      const zt = i === 0 ? y0 - 20 : y, zb = i === n - 1 ? y0 + total + 20 : y + rowH;
+      zone(-20, zt, W + 40, zb - zt, o.fn, { x: x + 1, y, w: w - 2, h: rowH }, o.id || 'opt' + i);
     });
   }
 
-  /** List screen: a panel with a title and rows. rows: [{icon, label, sub, right, btn:{label, fn, id, dim}, fn, id, dim}] */
+  /** List screen: flat card, title rule, aligned icon/label/button baselines. rows: [{icon, label, sub, right, btn, fn, id, dim}] */
   function drawRows(title, rows, opts) {
     opts = opts || {};
-    const b = S.bounds(), rowH = opts.rowH || (rows.some(r => r.sub) ? 19 : 14), gap = 2, x = 2, w = W - 4, head = title ? 15 : 3;
-    const total = head + rows.length * (rowH + gap) + 3;
+    const FH = T.FONT_H, hasIcon = rows.some(r => r.icon), iconGutter = hasIcon ? 13 : 0;
+    const b = S.bounds(), rowH = opts.rowH || (rows.some(r => r.sub) ? 18 : 13), x = 2, w = W - 4;
+    const head = title ? 13 : 2, pad = 2, btnH = 11;
+    const total = head + rows.length * rowH + pad;
     const y0 = opts.y != null ? opts.y : Math.max(b.top + 2, Math.min(b.bottom - total - 2, Math.round((b.top + b.bottom) / 2 - total / 2)));
     S.panel(x, y0, w, total);
     if (title) {
-      S.text(title, x + 6, y0 + 5, UI.accent);
-      if (opts.right) { const rx = x + w - 6 - S.textW(opts.right); if (rx > x + 10 + S.textW(title)) S.text(opts.right, rx, y0 + 5, opts.rightCol || UI.text); }
+      S.textMid(title, x + 5, y0, head - 1, UI.accent);
+      if (opts.right) {
+        const rx = x + w - 5 - S.textW(opts.right);
+        if (rx > x + 8 + S.textW(title)) S.textMid(opts.right, rx, y0, head - 1, opts.rightCol || UI.dim);
+      }
+      S.rule(x + 4, y0 + head - 2, w - 8);
     }
     ui.rows = rows;
     rows.forEach((r, i) => {
-      const y = y0 + head + i * (rowH + gap), hi = ui.lastInput === 'key' && ui.sub === i;
-      S.rect(x + 3, y, w - 6, rowH, hi ? '#2c3549' : '#1a2130');
-      let tx = x + 6;
-      if (r.icon) { const gl = T.SPR[r.icon]; S.glyph(r.icon, tx, y + Math.floor((rowH - gl.h) / 2), r.iconCol || (r.dim ? UI.dim : UI.accent)); tx += 14; }
-      let bw = r.btn ? Math.max(18, S.textW(r.btn.label) + 8) : 0;
-      const maxT = x + w - 5 - (bw ? bw + 3 : 2) - tx;
-      S.text(fitText(r.label, maxT), tx, y + (r.sub ? 3 : Math.floor((rowH - 6) / 2)), r.dim ? UI.dim : (r.col || UI.text));
-      if (r.sub) S.text(fitText(r.sub, maxT), tx, y + 11, r.subCol || UI.dim);
+      const y = y0 + head + i * rowH, hi = ui.lastInput === 'key' && ui.sub === i;
+      if (hi) { S.rect(x + 1, y, w - 2, rowH, '#243044'); S.rect(x + 1, y + 2, 2, rowH - 4, UI.accent); }
+      const colX = x + 5;
+      const tx = colX + iconGutter;
+      let bw = r.btn ? Math.max(16, S.textW(r.btn.label) + 6) : 0;
+      const maxT = x + w - 4 - (bw ? bw + 3 : 2) - tx;
+      const label = fitText(r.label, maxT);
+      // Shared baseline: icon / label / right / button text all on the same y
+      const ly = r.sub ? y + 2 : y + Math.floor((rowH - FH) / 2);
+      const by = ly - Math.floor((btnH - FH) / 2);
+      if (r.icon) {
+        const gl = T.SPR[r.icon];
+        S.glyph(r.icon, colX + Math.floor((11 - gl.w) / 2), y + Math.floor((rowH - gl.h) / 2), r.iconCol || (r.dim ? UI.dim : UI.accent));
+      }
+      S.text(label, tx, ly, r.dim ? UI.dim : (r.col || UI.text));
+      if (r.sub) S.text(fitText(r.sub, maxT), tx, ly + 8, r.subCol || UI.dim);
       if (r.btn) {
-        const bx = x + w - 5 - bw, by = y + Math.floor((rowH - 13) / 2);
-        S.button(bx, by, bw, 13, r.btn.label, false, r.btn.dim ? UI.dim : (r.btn.col || UI.accent));
-        zone(bx - 3, y - 1, bw + 6, rowH + 2, r.btn.fn, { x: bx, y: by, w: bw, h: 13 }, r.btn.id);
-      } else if (r.right && x + w - 7 - S.textW(r.right) > tx + S.textW(r.label) + 4) S.text(r.right, x + w - 7 - S.textW(r.right), y + (r.sub ? 3 : Math.floor((rowH - 6) / 2)), r.rightCol || UI.dim);
-      if (r.fn) zone(x + 3, y, w - 6 - (bw ? bw + 8 : 0), rowH, r.fn, { x: x + 3, y, w: w - 6, h: rowH }, r.id);
+        const bx = x + w - 3 - bw;
+        S.button(bx, by, bw, btnH, r.btn.label, false, r.btn.dim ? UI.dim : (r.btn.col || UI.accent));
+        zone(bx - 2, y, bw + 4, rowH, r.btn.fn, { x: bx, y: by, w: bw, h: btnH }, r.btn.id);
+      } else if (r.right && x + w - 4 - S.textW(r.right) > tx + S.textW(label) + 3) {
+        S.text(r.right, x + w - 4 - S.textW(r.right), ly, r.rightCol || UI.dim);
+      }
+      if (r.fn) zone(x + 1, y, w - 2 - (bw ? bw + 5 : 0), rowH, r.fn, { x: x + 1, y, w: w - 2, h: rowH }, r.id);
     });
     return { y0, total };
   }
@@ -378,8 +403,8 @@
     { label: 'LIGHTS ON', note: state.lightsOff ? '' : 'ON', fn: () => setLights(true), id: 'lightsOn' },
     { label: 'LIGHTS OFF', note: state.lightsOff ? 'ON' : 'sleep', fn: () => setLights(false), id: 'lightsOff' }];
   const BATTLE_OPTS = () => [
-    { label: 'RANDOM ONLINE', note: '-' + E.COST.online + ' EN', fn: () => startBattle('find'), id: 'bRandom' },
-    { label: 'VS COMPUTER', note: '-' + E.COST.cpu + ' EN', fn: () => startBattle('cpu'), id: 'bCpu' },
+    { label: 'RANDOM', note: E.COST.online + ' EN', fn: () => startBattle('find'), id: 'bRandom' },
+    { label: 'VS CPU', note: E.COST.cpu + ' EN', fn: () => startBattle('cpu'), id: 'bCpu' },
     { label: 'FRIEND CODE', note: 'free', fn: openLinkPanel, id: 'bFriend' },
     { label: 'CHALLENGE', note: 'free', fn: openChallengePanel, id: 'bChallenge' }];
 
@@ -396,11 +421,11 @@
       { icon: 'i_gear', label: 'SETTINGS', fn: () => { ui.mode = 'settings'; ui.sub = 0; }, id: 'mSettings' }];
   }
   function settingsRows() {
-    const nl = Notify.label();
+    const nl = Notify.label(), nb = nl === 'BLOCKED' ? 'NO' : nl === 'N/A' ? '--' : nl;
     return [
       { icon: A.muted ? 'i_mute' : 'i_sound', label: 'SOUND', btn: { label: A.muted ? 'OFF' : 'ON', fn: toggleMute, id: 'sSound', col: A.muted ? UI.dim : UI.accent } },
-      { icon: 'i_attention', label: 'ALERTS', sub: 'notifications', btn: { label: nl, fn: () => Notify.toggle(), id: 'sNotify', col: nl === 'ON' ? UI.accent : UI.dim } },
-      { icon: 'i_status', label: 'ACCOUNT', sub: user ? (user.isGuest ? 'guest: save it' : user.username) : '', btn: { label: 'OPEN', fn: openAccount, id: 'sAccount' } },
+      { icon: 'i_attention', label: 'ALERTS', sub: 'notify', btn: { label: nb, fn: () => Notify.toggle(), id: 'sNotify', col: nb === 'ON' ? UI.accent : UI.dim } },
+      { icon: 'i_status', label: 'ACCOUNT', sub: user ? (user.isGuest ? 'guest' : user.username) : '', btn: { label: 'OPEN', fn: openAccount, id: 'sAccount' } },
       { icon: 'i_back', label: 'LOG OUT', btn: { label: 'GO', fn: askLogout, id: 'sLogout' } }];
   }
   function askLogout() {
@@ -426,10 +451,10 @@
   function drawPaged(t, title, lines, page, pages, onNext, id) {
     const b = S.bounds(), x = 3, w = W - 6, y = Math.max(b.top + 2, -66), h = Math.min(b.bottom - 2 - y, 150);
     S.panel(x, y, w, h);
-    S.text(title, x + 6, y + 5, UI.accent);
-    const pg = (page + 1) + '/' + pages; S.text(pg, x + w - 6 - S.textW(pg), y + 5, UI.dim);
-    S.rect(x + 5, y + 14, w - 10, 1, UI.inner);
-    let ly = y + 19;
+    S.textMid(title, x + 5, y + 2, 11, UI.accent);
+    const pg = (page + 1) + '/' + pages; S.textMid(pg, x + w - 5 - S.textW(pg), y + 2, 11, UI.dim);
+    S.rule(x + 4, y + 14, w - 8);
+    let ly = y + 18;
     for (const para of lines) { for (const ln of S.wrap(para, w - 12)) { if (ly < y + h - 16) S.text(ln, x + 6, ly, UI.text); ly += 8; } ly += 3; }
     for (let i = 0; i < pages; i++) S.rect(x + w / 2 - pages * 3 + i * 6, y + h - 8, 3, 3, i === page ? UI.accent : '#4a5366');
     if (blink(t, 500)) S.text('>', x + w - 10, y + h - 11, UI.accent);
@@ -452,10 +477,10 @@
     const x = 4, y = -58, w = 88, h = 106;
     S.panel(x, y, w, h);
     const titles = ['PROFILE', 'CARE', 'ENERGY', 'WALLET', 'RECORD'];
-    S.text(titles[ui.page], x + 7, y + 6, UI.accent);
-    S.text((ui.page + 1) + '/' + STATUS_PAGES, x + w - 7 - S.textW('5/5'), y + 6, UI.dim);
-    S.rect(x + 5, y + 15, w - 10, 1, UI.inner);
-    const cx = x + 7, cy = y + 22, X = T.Battle, L = Pet.level(s);
+    S.textMid(titles[ui.page], x + 5, y + 2, 12, UI.accent);
+    S.textMid((ui.page + 1) + '/' + STATUS_PAGES, x + w - 5 - S.textW('5/5'), y + 2, 12, UI.dim);
+    S.rule(x + 4, y + 15, w - 8);
+    const cx = x + 5, cy = y + 21, X = T.Battle, L = Pet.level(s);
     switch (ui.page) {
       case 0: {
         const k = petKey(), a = sz(k);
@@ -521,9 +546,9 @@
     drawMain(t, true); dim();
     const b = S.bounds(), x = 3, w = W - 6, y = Math.max(b.top + 2, -58), h = 104;
     S.panel(x, y, w, h);
-    S.text('DISCIPLINE', x + 6, y + 5, UI.accent);
-    S.rect(x + 5, y + 14, w - 10, 1, UI.inner);
-    S.text('Obedience ' + state.discipline + '%', x + 6, y + 19, UI.text);
+    S.textMid('DISCIPLINE', x + 5, y + 2, 11, UI.accent);
+    S.rule(x + 4, y + 14, w - 8);
+    S.text('Obedience ' + state.discipline + '%', x + 5, y + 19, UI.text);
     bar(x + 6, y + 28, w - 12, state.discipline / 100, UI.green);
     const acting = state.fakeCall;
     S.text(acting ? 'Acting up now? YES!' : 'Acting up now? No.', x + 6, y + 37, acting ? UI.red : UI.dim);
@@ -544,7 +569,7 @@
       let sub = k.short || k.desc, dimRow = false, right = null;
       if (k.kind === 'drink') {
         const left = k.perDay - (d.drinks || 0);
-        sub = '+' + k.energy + ' EN, ' + (left > 0 ? left + ' left today' : 'none left today');
+        sub = '+' + k.energy + ' EN · ' + (left > 0 ? left + ' left' : 'sold out');
         if (left <= 0) dimRow = true;
       }
       if (k.kind === 'tool' && (inv[k.tool] || 1) >= k.tier) { right = 'OWNED'; dimRow = true; }
@@ -606,12 +631,13 @@
     if (state.job) {
       const j = state.job, x = 3, w = W - 6, y = Math.max(b.top + 2, -60), h = 72, total = (j.endT - j.startT) || 1;
       S.panel(x, y, w, h);
-      S.text('AT WORK', x + 6, y + 5, UI.accent);
-      S.text(j.name, x + w - 6 - S.textW(j.name), y + 5, UI.text);
-      bar(x + 6, y + 17, w - 12, 1 - jobLeft() / total, UI.accent);
-      S.text('Back in ' + fmtDur(jobLeft()), x + 6, y + 26, UI.text);
-      S.text('Pays ' + j.pay + 'c' + (j.ore ? ' +' + j.ore + ' ore' : ''), x + 6, y + 35, UI.dim);
-      S.text('Gets hungry faster.', x + 6, y + 44, UI.dim);
+      S.textMid('AT WORK', x + 5, y + 2, 11, UI.accent);
+      S.textMid(j.name, x + w - 5 - S.textW(j.name), y + 2, 11, UI.text);
+      S.rule(x + 4, y + 14, w - 8);
+      bar(x + 5, y + 18, w - 10, 1 - jobLeft() / total, UI.accent);
+      S.text('Back in ' + fmtDur(jobLeft()), x + 5, y + 27, UI.text);
+      S.text('Pays ' + j.pay + 'c' + (j.ore ? ' +' + j.ore + ' ore' : ''), x + 5, y + 36, UI.dim);
+      S.text('Gets hungry faster.', x + 5, y + 45, UI.dim);
       S.button(x + w - 46, y + h - 16, 40, 13, 'RECALL');
       zone(x + w - 50, y + h - 19, 48, 18, askRecall, { x: x + w - 46, y: y + h - 16, w: 40, h: 13 }, 'recall');
     } else if (lj && !lj.seen) {
@@ -636,10 +662,11 @@
     const c = ui.confirm, b = S.bounds();
     dim();
     const x = 6, w = W - 12, lines = [].concat(...c.lines.map(l => S.wrap(l, w - 12)));
-    const h = 32 + lines.length * 9, y = Math.max(b.top + 2, Math.round((b.top + b.bottom) / 2 - h / 2) - 10);
+    const h = 36 + lines.length * 9, y = Math.max(b.top + 2, Math.round((b.top + b.bottom) / 2 - h / 2) - 10);
     S.panel(x, y, w, h, UI.accent);
-    S.text(c.title, x + 6, y + 5, UI.accent);
-    lines.forEach((l, i) => S.text(l, x + 6, y + 16 + i * 9, UI.text));
+    S.textMid(c.title, x + 5, y + 2, 11, UI.accent);
+    S.rule(x + 4, y + 14, w - 8);
+    lines.forEach((l, i) => S.text(l, x + 5, y + 18 + i * 9, UI.text));
     const bw = 36, by = y + h - 17;
     const hi = ui.lastInput === 'key';
     S.button(x + 5, by, bw, 13, c.yes.label, hi && ui.sub === 0, UI.accent);
@@ -654,8 +681,8 @@
     const q = ui.toast; if (!q || t > q.until) { ui.toast = null; return; }
     const b = S.bounds(), l2 = (q.l2 ? S.wrap(q.l2, W - 12) : []).slice(0, 3), h = 14 + l2.length * 9, y = b.bottom - h - 2;
     S.panel(0, y, W, h);
-    S.text(fitText(q.l1, W - 12), 6, y + 5, UI.accent);
-    l2.forEach((ln, i) => S.text(ln, 6, y + 14 + i * 9, UI.text));
+    S.textMid(fitText(q.l1, W - 12), 5, y + 1, l2.length ? 11 : h - 2, UI.accent);
+    l2.forEach((ln, i) => S.text(ln, 5, y + 14 + i * 9, UI.text));
   }
 
   // ---------------------------------------------------------------- care actions (server-validated)
@@ -1409,7 +1436,7 @@
         case 'feedMenu': case 'lightMenu': case 'battleMenu':
           updatePet(t); drawMain(t, true); dim();
           drawOptions(ui.mode === 'feedMenu' ? FEED_OPTS() : ui.mode === 'lightMenu' ? LIGHT_OPTS() : BATTLE_OPTS(),
-            { feedMenu: 'FEED', lightMenu: 'LIGHTS', battleMenu: 'BATTLE  ' + energy() + ' EN' }[ui.mode]);
+            { feedMenu: 'FEED', lightMenu: 'LIGHTS', battleMenu: 'BATTLE' }[ui.mode]);
           break;
         case 'menu': drawMain(t, true); dim(); drawRows('MAIN MENU', menuRows(), { right: user ? (user.username || 'guest') : '' , rightCol: UI.dim }); break;
         case 'settings': drawMain(t, true); dim(); drawRows('SETTINGS', settingsRows()); break;
