@@ -2,7 +2,7 @@
  *
  * The viewport is one low-res canvas scaled up by an integer factor (crisp pixels). Gameplay happens on a
  * 96x48 "stage" (STAGE_W x STAGE_H) standing on a dirt path in a meadow; negative y reaches into the sky.
- * Environments: 'day' | 'dusk' (asleep, lights on) | 'night' (lights off) | 'battle'.
+ * Environments: 'day' | 'dusk' (asleep, lights on) | 'night' (lights off) | 'battle' | 'mine' (Pix Town Jobs).
  * Drawing helpers take STAGE coordinates.
  */
 (function (T) {
@@ -22,7 +22,8 @@
     day: (c) => c,
     battle: (c) => [c[0] * 1.02, c[1] * 1.02, c[2] * 1.0],
     dusk: (c) => [c[0] * 0.72 + 22, c[1] * 0.58 + 12, c[2] * 0.62 + 30],
-    night: (c) => [c[0] * 0.22 + 4, c[1] * 0.3 + 8, c[2] * 0.46 + 24]
+    night: (c) => [c[0] * 0.22 + 4, c[1] * 0.3 + 8, c[2] * 0.46 + 24],
+    mine: (c) => [c[0] * 0.96 + 5, c[1] * 0.92 + 2, c[2] * 0.86]
   };
   const tint = (h, env) => rgb((TINT[env] || TINT.day)(hex(h)));
   const hash = (n) => { n = (n ^ 61) ^ (n >>> 16); n = (n + (n << 3)) | 0; n ^= n >>> 4; n = Math.imul(n, 0x27d4eb2d); n ^= n >>> 15; return (n >>> 0) / 4294967295; };
@@ -38,7 +39,8 @@
     day:    ['#6f8fae', '#7b99b6', '#89a4bf', '#98b0c7', '#a9bdcf'],
     battle: ['#6f8fae', '#7b99b6', '#89a4bf', '#98b0c7', '#a9bdcf'],
     dusk:   ['#262a45', '#363655', '#4d4461', '#6c5667', '#8a6a6a'],
-    night:  ['#070b17', '#0a0f1e', '#0d1325', '#10182c', '#131d33']
+    night:  ['#070b17', '#0a0f1e', '#0d1325', '#10182c', '#131d33'],
+    mine:   ['#7d93ab', '#8a9db3', '#98a8bb', '#a8b5c4', '#b8c2cd']
   };
   const G = { g0: '#1c3019', g1: '#253f21', g2: '#30502a', g3: '#3d6133', g4: '#4f7541',
               t0: '#15241a', t1: '#1f3524', t2: '#2b472d', t3: '#3b5d38', t4: '#50764a',
@@ -165,6 +167,7 @@
       this.stampArt(g, 'rock', Math.floor(W * 0.08), Math.min(Hh - this.bot - 16, py1 + 14));
       this.stampArt(g, 'rockS', W - Math.floor(W * 0.2), hz + 3);
     }
+    if (env === 'mine') this.paintMine(g, dot, hz);
     // --- tint to environment
     if (env !== 'day') {
       const id = g.getImageData(0, 0, W, Hh), d = id.data, f = TINT[env];
@@ -181,6 +184,52 @@
     }
     g.globalCompositeOperation = 'source-over';
     return cv;
+  };
+  /** Pix Town Mine: little town on the horizon, a rock cliff with a timber mine entrance, a sign and rails. */
+  P.paintMine = function (g, dot, hz) {
+    const W = this.sw, ox = this.sx0, oy = this.sy0, H = this.H, rect = (x, y, w, h, c) => { g.fillStyle = c; g.fillRect(x, y, w, h); };
+    // Pix Town on the horizon (left)
+    for (let i = 0; i < 4; i++) {
+      const x = ox - 34 + i * 17 + (i % 2) * 3, w = 9 + (i % 2) * 3, h = 6 + (i % 3), y = hz - h;
+      if (x + w < 0 || x > ox + 40) continue;
+      rect(x, y, w, h, '#b7a386'); rect(x, y, w, 1, '#d2c2a4'); rect(x + w - 1, y, 1, h, '#8f7d64');
+      for (let r = 0; r < 4; r++) rect(x - 1 + r, y - 1 - r, w + 2 - r * 2, 1, r ? '#8a3f32' : '#6d3027');
+      rect(x + 2, y + 2, 2, 2, '#e8c870'); if (w > 10) rect(x + w - 4, y + 2, 2, 2, '#e8c870');
+    }
+    // rock cliff (right)
+    const cx0 = ox + 42, base = oy + H - 9;
+    for (let x = cx0; x < W; x++) {
+      const k = Math.min(1, (x - cx0) / 18), top = Math.round(hz - 10 - k * 30 - vnoise(x, 5, 6) * 6 - vnoise(x, 50, 17) * 8);
+      for (let y = top; y < base; y++) {
+        const n = vnoise(x, y, 4), m = h2(x, y);
+        let c = n > 0.62 ? '#857a6e' : n > 0.4 ? '#6d6259' : n > 0.22 ? '#574d45' : '#40372f';
+        if (y === top) c = '#9a9082'; else if (y === top + 1) c = '#857a6e';
+        if (m > 0.985) c = '#c2ad5a';
+        if ((x + y * 3) % 23 === 0 && m > 0.5) c = '#40372f';
+        dot(x, y, c);
+      }
+      if (x === cx0) for (let y = top; y < base; y++) dot(x, y, '#40372f');
+    }
+    // timber mine entrance
+    const ex = ox + 60, ey = oy + 18, ew = 24, eb = oy + H - 2;
+    rect(ex + 3, ey + 3, ew - 6, eb - ey - 3, '#0c0a09');
+    for (let y = ey + 3; y < eb; y += 3) rect(ex + 3, y, ew - 6, 1, '#15110e');
+    rect(ex, ey + 2, 3, eb - ey - 2, '#6b4a2a'); rect(ex + ew - 3, ey + 2, 3, eb - ey - 2, '#6b4a2a');
+    rect(ex + 2, ey + 2, 1, eb - ey - 2, '#3e2a17'); rect(ex + ew - 1, ey + 2, 1, eb - ey - 2, '#3e2a17');
+    rect(ex - 2, ey, ew + 4, 3, '#7d5932'); rect(ex - 2, ey + 2, ew + 4, 1, '#3e2a17'); rect(ex - 2, ey, ew + 4, 1, '#9a7446');
+    // sign above the entrance
+    const sx = ex + 5, sy = ey - 8;
+    rect(sx + 2, sy + 5, 1, 3, '#3e2a17'); rect(sx + 11, sy + 5, 1, 3, '#3e2a17');
+    rect(sx, sy, 14, 6, '#8a6a44'); rect(sx, sy, 14, 1, '#a8865a'); rect(sx, sy + 5, 14, 1, '#4f3a22');
+    for (let i = 0; i < 4; i++) rect(sx + 2 + i * 3, sy + 2, 2, 2, '#2e2217');
+    // rails along the path into the mine
+    const r1 = oy + H - 1, r2 = oy + H + 2;
+    for (let x = 0; x < ex + 16; x += 4) rect(x, r1 - 1, 2, 5, '#4a3524');
+    rect(0, r1, ex + 16, 1, '#8d949e'); rect(0, r2, ex + 16, 1, '#8d949e'); rect(0, r1 + 1, ex + 16, 1, '#50565e'); rect(0, r2 + 1, ex + 16, 1, '#50565e');
+    // ore pile + pickaxe by the entrance
+    const px = ex + ew + 3, py = oy + H - 4;
+    [[0, 2, 7], [1, 1, 5], [2, 0, 3]].forEach(([dy, dx, w]) => rect(px + dx, py + 2 - dy, w, 1, dy ? '#7d808a' : '#5a5d66'));
+    dot(px + 3, py, '#c2ad5a'); dot(px + 5, py + 1, '#c2ad5a');
   };
   P.stampArt = function (g, key, x, y) {
     const a = M.get(key, 0); if (!a) return;
@@ -231,6 +280,13 @@
           dot(px, py, k > hgt - 2 ? pal[3] : k > hgt / 2 ? pal[2] : pal[1]);
         }
       }
+    }
+    if (env === 'mine') {        // flickering lantern by the mine entrance
+      const lx = this.sx0 + 56, ly = this.sy0 + 21, f = Math.sin(s * 9) + Math.sin(s * 23) > 0.2;
+      g.fillStyle = '#3e2a17'; g.fillRect(lx + 1, ly - 3, 1, 3);
+      g.fillStyle = '#2e2217'; g.fillRect(lx, ly, 3, 1); g.fillRect(lx, ly + 4, 3, 1);
+      g.fillStyle = f ? '#ffd27a' : '#e0a040'; g.fillRect(lx, ly + 1, 3, 3);
+      g.fillStyle = f ? 'rgba(255,210,120,0.22)' : 'rgba(255,190,90,0.14)'; g.fillRect(lx - 3, ly - 2, 9, 9);
     }
     if (env === 'night') {       // a few faint fireflies
       for (let i = 0; i < 4; i++) {

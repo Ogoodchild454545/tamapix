@@ -9,25 +9,140 @@
   <title>TAMA·PIX — monster raiser</title>
   <link rel="stylesheet" href="css/style.css">
 </head>
-<body data-mode="main" data-env="day">
+<body data-mode="main" data-env="day" class="booting">
   <canvas id="scene" aria-label="Your monster in the meadow. Tap the choices shown on screen."></canvas>
 
   <nav class="bar top" id="barTop" aria-label="Care actions"></nav>
+  <div class="wallet" id="wallet" role="status" aria-label="Energy and coins">
+    <span class="wl energy"><canvas class="wicon" data-icon="i_energy"></canvas><span class="meter"><i id="energyFill"></i></span><b id="energyNum">-</b></span>
+    <span class="wl coins"><canvas class="wicon" data-icon="i_coin"></canvas><b id="coinNum">-</b></span>
+  </div>
   <nav class="bar bottom" id="barBottom" aria-label="More actions"></nav>
 
-  <!-- Friend-code panel, opened from BATTLE › FRIEND -->
+  <!-- log in / sign up / guest -->
+  <div class="modal full" id="authPanel" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+      <canvas id="authArt" width="160" height="80" aria-hidden="true"></canvas>
+      <h2 id="authTitle">TAMA·PIX</h2>
+      <p class="tagline">Raise a monster. It lives on the server, in real time.</p>
+      <div class="tabs" role="tablist">
+        <button type="button" role="tab" id="tabLogin" class="tab on" data-tab="login">Log in</button>
+        <button type="button" role="tab" id="tabSignup" class="tab" data-tab="signup">Sign up</button>
+      </div>
+      <form id="authForm" autocomplete="on" novalidate>
+        <label class="lbl" for="authUser">Username</label>
+        <input id="authUser" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" maxlength="16" placeholder="3-16 letters, numbers, _">
+        <label class="lbl" for="authPass">Password</label>
+        <input id="authPass" name="password" type="password" autocomplete="current-password" maxlength="128" placeholder="at least 8 characters">
+        <div class="signup-only">
+          <label class="lbl" for="authYear">Year of birth <small>(optional, for future parental controls)</small></label>
+          <input id="authYear" name="birthYear" inputmode="numeric" maxlength="4" placeholder="e.g. 1995">
+          <label class="check"><input id="authAdult" type="checkbox"> I am 18 or older</label>
+        </div>
+        <p class="err" id="authError" role="alert"></p>
+        <button id="authGo" type="submit" class="primary">Log in</button>
+      </form>
+      <div class="or"><span>or</span></div>
+      <button id="guestGo" type="button" class="ghost wide">Play as guest</button>
+      <p class="note" id="authNote">Guests can save their monster as an account later (Menu › Settings › Account).</p>
+      <p class="note warn" id="ephemeralNote" hidden>Test server: saves are reset whenever the server restarts.</p>
+    </div>
+  </div>
+
+  <!-- one-time import of an old browser-only save -->
+  <div class="modal" id="importPanel" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="importTitle">
+      <h2 id="importTitle">Bring your monster?</h2>
+      <canvas id="importArt" width="84" height="84" aria-hidden="true"></canvas>
+      <p id="importText">This device has a monster from the old version of TAMA·PIX.</p>
+      <p class="note">You can import it into this account once. The server checks it and may adjust anything that looks off.</p>
+      <p class="err" id="importError" role="alert"></p>
+      <div class="actions">
+        <button id="importSkip" type="button" class="ghost">Start fresh</button>
+        <button id="importGo" type="button" class="primary">Import</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- account (Menu > Settings > Account) -->
+  <div class="modal" id="accountPanel" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="accTitle">
+      <h2 id="accTitle">Account</h2>
+      <p id="accWho"></p>
+      <p class="lbl">Your friend code</p>
+      <div class="coderow"><code id="accCode">…</code></div>
+      <form id="upgradeForm" novalidate hidden>
+        <p class="note">You're playing as a guest. Pick a username and password to keep your monster safe:</p>
+        <label class="lbl" for="upUser">Username</label>
+        <input id="upUser" autocomplete="username" autocapitalize="off" spellcheck="false" maxlength="16">
+        <label class="lbl" for="upPass">Password</label>
+        <input id="upPass" type="password" autocomplete="new-password" maxlength="128">
+        <label class="lbl" for="upYear">Year of birth <small>(optional)</small></label>
+        <input id="upYear" inputmode="numeric" maxlength="4">
+        <button id="upGo" type="submit" class="primary wide">Save as account</button>
+      </form>
+      <p class="err" id="accError" role="alert"></p>
+      <div class="actions">
+        <button id="accClose" type="button" class="ghost">Back</button>
+        <button id="accLogout" type="button">Log out</button>
+      </div>
+      <button id="accDelete" type="button" class="danger wide">Delete account</button>
+    </div>
+  </div>
+
+  <!-- friend code battle (Battle > Friend code) -->
   <div class="modal" id="linkPanel" hidden>
     <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="linkTitle">
       <h2 id="linkTitle">Friend Battle</h2>
-      <p class="lbl">Your monster's code. Send it to a friend:</p>
+      <p class="lbl">Your code. Send it to a friend:</p>
       <div class="coderow"><code id="myCode">…</code><button id="copyCode" type="button">Copy</button></div>
-      <label class="lbl" for="friendCode">Paste your friend's code:</label>
-      <input id="friendCode" placeholder="TP-..." spellcheck="false" autocomplete="off" autocapitalize="off" inputmode="text">
+      <label class="lbl" for="friendCode">Your friend's code:</label>
+      <input id="friendCode" placeholder="PX-XXXXXX" spellcheck="false" autocomplete="off" autocapitalize="characters" inputmode="text" maxlength="40">
+      <p class="note">You battle your friend's real monster (the server controls it). Free: no energy, XP from 5 a day, no coins.</p>
       <p class="err" id="linkError" role="alert"></p>
       <div class="actions">
         <button id="linkClose" type="button" class="ghost">Back</button>
-        <button id="linkFight" type="button">Battle!</button>
+        <button id="linkFight" type="button" class="primary">Battle!</button>
       </div>
+    </div>
+  </div>
+
+  <!-- challenge a player (Battle > Challenge a player) -->
+  <div class="modal" id="challengePanel" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="chTitle">
+      <h2 id="chTitle">Challenge a player</h2>
+      <label class="lbl" for="chTarget">Their username or PX- friend code:</label>
+      <input id="chTarget" placeholder="username or PX-XXXXXX" spellcheck="false" autocomplete="off" autocapitalize="off" maxlength="40">
+      <p class="note">They see it on their bell. If you're both online when they accept, you battle live; otherwise they fight your monster (the server controls it).</p>
+      <p class="err" id="chError" role="alert"></p>
+      <ul id="chList" class="chlist"></ul>
+      <div class="actions">
+        <button id="chClose" type="button" class="ghost">Back</button>
+        <button id="chSend" type="button" class="primary">Challenge!</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- attention panel (the bell) -->
+  <div class="modal" id="attnPanel" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="attnTitle">
+      <h2 id="attnTitle">Needs attention</h2>
+      <ul id="attnList" class="attn"></ul>
+      <p class="note" id="attnEmpty">All good. Nothing needs you right now.</p>
+      <div class="actions">
+        <button id="attnChallenge" type="button" class="ghost">Challenge…</button>
+        <button id="attnClose" type="button" class="primary">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- server unreachable -->
+  <div class="modal full" id="offlinePanel" hidden>
+    <div class="sheet" role="alertdialog" aria-modal="true" aria-labelledby="offTitle">
+      <h2 id="offTitle">Offline</h2>
+      <p>Can't reach the TAMA·PIX server. Your monster lives on the server and is safe there; nothing is played on this device while offline.</p>
+      <p class="note" id="offDetail"></p>
+      <div class="actions"><span></span><button id="offRetry" type="button" class="primary">Retry</button></div>
     </div>
   </div>
 
@@ -41,7 +156,10 @@
   <script src="js/personality.js"></script>
   <script src="js/pet.js"></script>
   <script src="js/battle.js"></script>
+  <script src="js/economy.js"></script>
+  <script src="js/api.js"></script>
   <script src="js/net.js"></script>
+  <script src="js/account.js"></script>
   <script src="js/debug.js"></script>
   <script src="js/game.js"></script>
 </body>

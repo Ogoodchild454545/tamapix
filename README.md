@@ -12,9 +12,8 @@ computer, a friend's code, or a random player online.
 * **Egg** hatches after 1 minute into the **BLOB**: every pet is this shapeless mass until day 2.
 * **Day 2** (48 h after hatching): 1st evolution into one of 6 forms, chosen from what happened during days 0-2.
 * **Day 5**: final evolution; each day-2 form has 2 possible finals, chosen from days 2-5 (+1 secret final).
-* Age is real elapsed time since hatching and keeps counting while the game is closed. The pet sleeps from 22:00
-  to 07:00 on your local clock (a newborn stays up for its first hour); needs don't drop and evolutions wait while
-  it sleeps, so an evolution that falls due at night happens when it wakes. The status screen shows
+* Age is real elapsed time since hatching and keeps counting while the game is closed. The pet sleeps when energy is empty or the lights are off (not on a fixed night clock); needs don't drop and evolutions wait while
+  it sleeps. The status screen shows
   "Evolves in 1d 4h".
 * **Needs** (awake time): a hunger heart every 45-90 min, a mood heart every 55-100 min, a poop every ~2-3 h.
   Ignoring an empty heart 30 min, leaving the light on 30 min at night, a poop 2 h or sickness 3 h = a **care mistake**.
@@ -40,12 +39,16 @@ little to battle stats: +1 HP per 15 levels, +1 POW per 12, +1 DEF per 18, +1 SP
 ## Play
 * **Just the game:** open `index.html` directly (file://) or serve the folder with any static server
   (`python3 -m http.server`). Everything works; RANDOM online battles fall back to a computer rival.
-* **With online battles:**
+* **With accounts, economy and online battles:**
   ```bash
-  npm install          # (repo root) installs the single dependency: ws
-  npm start            # http://localhost:8080  (PORT=xxxx and HOST=... env vars supported)
+  npm install          # bcryptjs, pg, ws
+  SESSION_SECRET=dev npm start   # http://localhost:8080  (PORT / HOST env vars supported)
   ```
-  The Node server serves the game **and** the WebSocket endpoint (`/ws`). Open the page from it on two
+  Optional: `DATABASE_URL` for Postgres. Without it the server uses a JSON file under `server/data/`
+  (resets if the host wipes the disk). Set `SESSION_SECRET` in production.
+  Sign up, log in, or play as guest. Energy/coins, Fizz shop, Pix Town jobs, main menu and the
+  notification bell need the Node server (not file://).
+  The same process serves the game **and** the WebSocket endpoint (`/ws`). Open it on two
   devices/browsers, pick BATTLE › RANDOM on both, and they get matched.
 * Health check: `GET /healthz`.
 
@@ -101,7 +104,7 @@ Config: `CONFIG.SERVER_URL` in `js/config.js` (default `''` = same host, `ws(s):
 * Or host the static files on a CDN/GitHub Pages and point `SERVER_URL` at the WebSocket host (enable CORS-free wss).
 * It keeps all state in memory and is a single process: fine for a hobby deployment; for more players add sticky
   sessions or a shared queue (Redis), per-IP connection limits/rate limiting, logging/monitoring, and a process
-  manager (systemd/pm2). There are no accounts, so the server can't stop someone from editing their *own* save
+  manager (systemd/pm2). With accounts, pets/coins/energy are server-side; without a login a guest can still edit a local save
   in localStorage (it only checks the pet is plausible) – real persistence would need server-side profiles.
 
 ## Files

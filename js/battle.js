@@ -2,10 +2,10 @@
  *
  * Battle data ("card") = { name, formId, xp, training, wins, battles, weight }.
  *
- * Levels (1-50) come ONLY from XP, and XP only from training sessions and battles (see XP below). The level adds
- * a little to every battle stat, so a trained monster beats an untrained one of the same species.
- * The card is what gets encoded into a friend code, so an opponent built from a code
- * shows the right species sprite, name and stats.
+ * Levels (1-50) come ONLY from XP, and XP only from training sessions and battles (see XP below). XP per action
+ * grows a little with your level (x(1 + (L-1)/10)) so the per-stage level caps (BLOB 10, day-2 25, final 40) are
+ * reachable on free energy. The level adds a little to every battle stat.
+ * Cards are always built by the SERVER from the pet it stores (friend codes are server-issued ids, see server/).
  *
  * Round: you pick HIGH (A) or LOW (B). The defender guesses a guard direction; a CPU
  * leans towards whatever you did last, so mix it up. Stats: hp = health, pow = damage,
@@ -33,12 +33,14 @@
       return L;
     },
     level(card) { return this.levelFromXp(card && card.xp); },
-    trainXp(hits) { return this.XP.TRAIN_BASE + this.XP.TRAIN_PER_HIT * Math.max(0, Math.min(5, hits | 0)); },
+    /** XP multiplier for your level: Lv1 x1.0, Lv11 x2.0, Lv31 x4.0. */
+    levelScale(L) { return 1 + (Math.max(1, L || 1) - 1) / 10; },
+    trainXp(hits, level) { return Math.round((this.XP.TRAIN_BASE + this.XP.TRAIN_PER_HIT * Math.max(0, Math.min(5, hits | 0))) * this.levelScale(level)); },
     /** XP for a finished battle. result: 'win' | 'loss' | 'fled'. */
     battleXp(result, myLevel, foeLevel) {
-      const X = this.XP, d = (foeLevel || myLevel) - myLevel;
-      if (result === 'win') return U.clamp(X.WIN + d * X.WIN_PER_LEVEL, X.WIN_MIN, X.WIN_MAX);
-      if (result === 'loss') return U.clamp(X.LOSS + d * X.LOSS_PER_LEVEL, X.LOSS_MIN, X.LOSS_MAX);
+      const X = this.XP, d = (foeLevel || myLevel) - myLevel, k = this.levelScale(myLevel);
+      if (result === 'win') return Math.round(U.clamp(X.WIN + d * X.WIN_PER_LEVEL, X.WIN_MIN, X.WIN_MAX) * k);
+      if (result === 'loss') return Math.round(U.clamp(X.LOSS + d * X.LOSS_PER_LEVEL, X.LOSS_MIN, X.LOSS_MAX) * k);
       return 0;
     },
 
@@ -66,11 +68,11 @@
       return { card, name: card.name, form: T.FORMS[card.formId], st, hp: st.hp, max: st.hp,
                turns: 0, guardNext: false, dodgeNext: false, absorbNext: false, stunned: false, lastDir: null };
     },
-    /** A computer rival of the same stage, around your level (-2 .. +3). */
+    /** A computer rival of the same stage, around your level (-2 .. +3, within the stage's level cap). */
     cpuCard(stage, myLevel) {
       const st = stage === 'egg' ? 'baby' : stage;
       const pool = T.Evolution.formsByStage(st);
-      const lvl = U.clamp((myLevel || 1) + Math.floor(U.rand(-2, 4)), 1, this.XP.MAX_LEVEL);
+      const lvl = U.clamp((myLevel || 1) + Math.floor(U.rand(-2, 4)), 1, T.CONFIG.LEVEL_CAP[st] || this.XP.MAX_LEVEL);
       const battles = Math.floor(U.rand(0, lvl));
       return { name: T.Pet.randomName(), formId: U.pick(pool), xp: this.xpFor(lvl) + Math.floor(U.rand(0, 10)), training: Math.floor(U.rand(0, lvl * 2)),
                battles, wins: Math.floor(battles * U.rand(0.2, 0.8)), weight: T.CONFIG.MIN_WEIGHT[st] + Math.floor(U.rand(0, 12)) };
@@ -125,28 +127,11 @@
     },
 
     // ---------- friend codes ----------
-    encode(card) {
-      const safe = String(card.name).replace(/[^A-Z0-9]/gi, '').slice(0, 8).toUpperCase() || 'PAL';
-      const body = ['TP2', safe, card.formId, card.training | 0, card.wins | 0, card.battles | 0, card.weight | 0, card.xp | 0].join('|');
-      let h = 7; for (const ch of body) h = (h * 31 + ch.charCodeAt(0)) % 1296;
-      return 'TP-' + btoa(body + '|' + h.toString(36)).replace(/=+$/, '');
-    },
-    decode(code) {
-      try {
-        code = String(code).trim().replace(/^TP-/i, '');
-        const raw = atob(code + '==='.slice((code.length + 3) % 4));
-        const parts = raw.split('|');
-        const n = parts[0] === 'TP2' ? 9 : parts[0] === 'TP1' ? 8 : 0;      // TP1 = old codes without XP
-        if (!n || parts.length !== n) return null;
-        const body = parts.slice(0, n - 1).join('|');
-        let h = 7; for (const ch of body) h = (h * 31 + ch.charCodeAt(0)) % 1296;
-        if (h.toString(36) !== parts[n - 1]) return null;
-        const formId = T.LEGACY_FORMS[parts[2]] || parts[2];
-        if (!Object.prototype.hasOwnProperty.call(T.FORMS, formId) || formId === 'egg') return null;
-        const xp = n === 9 ? +parts[7] : Math.min(20000, 12 * (+parts[3]) + 30 * (+parts[4]));
-        return { name: parts[1], formId, xp, training: +parts[3], wins: +parts[4], battles: +parts[5], weight: +parts[6] };
-      } catch (e) { return null; }
-    }
+    // Codes are issued by the server ("PX-7K3Q9A") and point at the friend's account: the server fights with the pet
+    // it stores, so a code can't carry edited stats. Old self-contained codes ("TP-...") are recognised to explain that.
+    CODE_RE: /^PX-[A-HJ-NP-Z2-9]{6}$/,
+    normCode(code) { return String(code || '').trim().toUpperCase().replace(/^PX(?!-)/, 'PX-'); },
+    isLegacyCode(code) { return /^TP-[A-Za-z0-9+/]{16,}$/.test(String(code || '').trim()); }
   };
   T.Battle = Battle;
 })(window.Tama);

@@ -1,9 +1,10 @@
-/* TAMA-PIX — pet model: state, real-time simulation, care actions, XP, persistence + save migration.
- * Pure-ish logic, no drawing. Events are pushed to an array so the UI can react.
+/* TAMA-PIX — pet model: state, real-time simulation, care actions, XP, energy, jobs + old-save migration.
+ * Pure logic, no drawing, no storage. The SERVER runs it (server/rules.js loads this file) from timestamps; the
+ * browser only uses it for display helpers and the debug tree preview. Events are pushed to an array.
  *
- * Time: s.ageMs is game time since hatching (= real time; ?debug=1&speed=N speeds it up). The pet's clock
- * (for sleeping) is s.createdAt + eggMs + ageMs, i.e. your local time. Time away is simulated when the game is
- * opened again: the age counts fully, needs decay at CONFIG.OFFLINE_FACTOR.
+ * Time: s.simT = total simulated ms; s.ageMs = ms since hatching. The pet's clock (for sleeping) is
+ * s.createdAt + eggMs + ageMs in the player's time zone s.tz. Time away is simulated on the next request: the age
+ * counts fully, needs decay at CONFIG.OFFLINE_FACTOR.
  */
 (function (T) {
   'use strict';
@@ -15,11 +16,12 @@
   function create() {
     return {
       v: C.SAVE_VERSION, name: randomName(), formId: 'egg', stage: 'egg', history: ['egg'],
-      createdAt: Date.now(), eggMs: 0, ageMs: 0,
+      createdAt: Date.now(), eggMs: 0, ageMs: 0, simT: 0, tz: null,
+      energy: C.ENERGY.MAX, napping: false, job: null, careLow: false,
       hunger: 2, happy: 2, weight: 5, discipline: 0,
       poops: [],                     // [{age, counted}]
       sick: false, sickMs: 0, doses: 0, sickMistake: false,
-      asleep: false, lightsOff: false, lightMs: 0, lightMistake: false,
+      asleep: false, lightsOff: false,
       dead: false, cause: '',
       hungerT: 0, happyT: 0, poopT: U.rand(TT.POOP_MIN, TT.POOP_MAX) * 0.5,
       hungerZeroMs: 0, happyZeroMs: 0, hungerMistake: false, happyMistake: false,
@@ -28,7 +30,6 @@
       careMistakes: 0, poopMistakes: 0, meals: 0, snacks: 0, recentSnacks: 0,
       battles: 0, wins: 0, training: 0, plays: 0, xp: 0,
       st: T.Evolution.blankStageStats(),   // counters of the current stage (reset at each evolution)
-      lastSaved: Date.now()
     };
   }
 
@@ -54,20 +55,16 @@
     ev.push({ type: 'evolve', from, to });
   }
 
-  /** Local hour (0-24, fractional) on the pet's clock. */
+  /** Local hour (0-24, fractional) on the pet's clock (player's time zone s.tz). */
   function clockHour(s) {
-    const d = new Date(s.createdAt + s.eggMs + s.ageMs);
-    return d.getHours() + d.getMinutes() / 60;
+    const l = U.local(s.createdAt + s.eggMs + s.ageMs, s.tz || undefined);
+    return l.h + l.mi / 60;
   }
-  function isNight(s) {
-    if (s.ageMs < TT.NEWBORN_AWAKE) return false;
-    const h = clockHour(s);
-    return TT.SLEEP_AT > TT.WAKE_AT ? (h >= TT.SLEEP_AT || h < TT.WAKE_AT) : (h >= TT.SLEEP_AT && h < TT.WAKE_AT);
-  }
-
   /** One simulation step: dt = game ms of age; k = need-decay factor (1 while playing, OFFLINE_FACTOR away). */
   function step(s, dt, ev, k) {
     if (s.dead) return;
+    s.simT = (s.simT || 0) + dt;
+    if (s.job && s.simT >= s.job.endT) { const job = s.job; s.job = null; ev.push({ type: 'jobDone', job }); }
     if (s.stage === 'egg') {
       s.eggMs += dt;
       if (s.eggMs >= TT.HATCH) {
@@ -76,34 +73,37 @@
       return;
     }
     s.ageMs += dt;
-    const nd = dt * k;              // "need time" (softened while away)
+    const EN = C.ENERGY;
 
-    // --- day / night (pet clock = local time)
-    const night = isNight(s);
-    if (night && !s.asleep) { s.asleep = true; s.lightMs = 0; s.lightMistake = false; ev.push({ type: 'sleep' }); }
-    if (!night && s.asleep) { s.asleep = false; s.lightsOff = false; ev.push({ type: 'wake' }); }
-    if (s.asleep) {
-      if (!s.lightsOff) {
-        s.lightMs += nd;
-        if (s.lightMs >= TT.LIGHT_TIMEOUT && !s.lightMistake) { s.lightMistake = true; mistake(s, ev, 'light'); }
-      }
-      return; // nothing else happens while sleeping (no hunger, no evolution)
+    // --- sleep: only when the lights are off (sleeps until they go on, recharges fast) or when energy runs out
+    // (collapses into a nap with the lights on and wakes once partly recharged). Never while away at a job.
+    if (s.job) { if (s.asleep) { s.asleep = false; s.napping = false; } }
+    else if (!s.asleep && (s.lightsOff || s.energy <= 0)) {
+      s.asleep = true; s.napping = !s.lightsOff; ev.push({ type: 'sleep', nap: s.napping });
     }
+    if (s.asleep) {
+      if (s.lightsOff) s.napping = false;
+      s.energy = Math.min(EN.MAX, (s.energy || 0) + (s.napping ? EN.NAP_PER_H : EN.SLEEP_PER_H) * dt / TT.HOUR);
+      if (s.napping && s.energy >= EN.NAP_WAKE_AT) { s.asleep = false; s.napping = false; ev.push({ type: 'wake', nap: true }); }
+    }
+    const asleep = s.asleep;
+    const nd = dt * k * (asleep ? C.SLEEP_DECAY : 1);   // "need time": softened while away, and while asleep
 
-    // --- evolution (real age; only while awake)
+    // --- evolution (real age, asleep or awake)
     if (T.Evolution.due(s)) {
       const to = T.Evolution.pick(s);
       if (to) evolve(s, to, ev);
     }
 
-    // --- hearts decay
+    // --- hearts decay (faster while sick or working a job)
+    const working = !!s.job, wk = working ? C.WORK_DECAY : 1;
     const hr = TT.HUNGER[s.stage] || 60 * TT.MIN, pr = TT.HAPPY[s.stage] || 60 * TT.MIN;
-    s.hungerT += nd * (s.sick ? 1.5 : 1);
+    s.hungerT += nd * (s.sick ? 1.5 : 1) * wk;
     if (s.hungerT >= hr) {
       s.hungerT -= hr;
       if (s.hunger > 0) { s.hunger--; s.weight = Math.max(C.MIN_WEIGHT[s.stage] || 5, s.weight - 1); if (!s.hunger) ev.push({ type: 'call', why: 'hunger' }); }
     }
-    s.happyT += nd * (s.sick ? 1.5 : 1);
+    s.happyT += nd * (s.sick ? 1.5 : 1) * wk;
     if (s.happyT >= pr) { s.happyT -= pr; if (s.happy > 0) { s.happy--; if (!s.happy) ev.push({ type: 'call', why: 'happy' }); } }
 
     if (s.hunger === 0) {
@@ -115,6 +115,15 @@
       s.happyZeroMs += nd;
       if (s.happyZeroMs >= TT.CALL_TIMEOUT && !s.happyMistake) { s.happyMistake = true; mistake(s, ev, 'happy'); }
     } else { s.happyZeroMs = 0; s.happyMistake = false; }
+
+    // daily care bonus needs: hearts at 50%+ and no poop older than an hour (checked while awake at home)
+    if (!working && !asleep && (s.hunger < 2 || s.happy < 2 || s.poops.some(p => p.age > TT.HOUR))) s.careLow = true;
+    if (asleep && s.sick) {                  // sickness keeps going (slowly) in its sleep
+      s.sickMs += nd;
+      if (s.sickMs >= TT.SICK_TIMEOUT && !s.sickMistake) { s.sickMistake = true; mistake(s, ev, 'sick'); }
+      if (s.sickMs >= TT.SICK_DEATH) return die(s, ev, 'sick');
+    }
+    if (working || asleep) return;           // away at work / asleep: no poop, sickness rolls or fake calls
 
     // --- poop
     s.poopT -= nd;
@@ -154,11 +163,14 @@
     ev && ev.push({ type: 'sick' });
   }
 
-  function addXp(s, n) {
-    const before = T.Battle.levelFromXp(s.xp);
-    s.xp = (s.xp | 0) + Math.max(0, Math.round(n));
-    const after = T.Battle.levelFromXp(s.xp);
-    return { xp: Math.round(n), level: after, levelUp: after > before };
+  /** Add XP (times the daily taper `mult`), capped at the stage's level cap. */
+  function addXp(s, n, mult) {
+    const B = T.Battle, before = B.levelFromXp(s.xp), capXp = B.xpFor(C.LEVEL_CAP[s.stage] || 40);
+    const want = Math.max(0, Math.round(n * (mult == null ? 1 : mult)));
+    const got = Math.max(0, Math.min(want, capXp - (s.xp | 0)));
+    s.xp = (s.xp | 0) + got;
+    const after = B.levelFromXp(s.xp);
+    return { xp: got, level: after, levelUp: after > before, levels: after - before, capped: got < want };
   }
 
   // ---------------------------------------------------------------- save migration (v1 -> v2)
@@ -181,22 +193,22 @@
       s.ageMs = s.stage === 'baby' ? Math.min(o.ageMs || 0, TT.HOUR) : T.Evolution.entryAge(form);
     }
     const losses = Math.max(0, (o.battles || 0) - (o.wins || 0));
-    s.xp = Math.min(T.Battle.xpFor(30), 12 * (o.plays || 0) + 30 * (o.wins || 0) + 12 * losses);
+    s.xp = Math.min(T.Battle.xpFor(C.LEVEL_CAP[s.stage] || 10), 12 * (o.plays || 0) + 30 * (o.wins || 0) + 12 * losses);
     s.poopMistakes = 0; s.st = T.Evolution.blankStageStats();
     s.weight = Math.max(s.weight || 5, C.MIN_WEIGHT[s.stage] || 5);
     s.hungerT = 0; s.happyT = 0; s.hungerZeroMs = 0; s.happyZeroMs = 0; s.sickMs = 0; s.lightMs = 0;
     s.poopT = U.rand(TT.POOP_MIN, TT.POOP_MAX) * 0.5; s.fakeT = U.rand(TT.FAKE_MIN, TT.FAKE_MAX);
     s.poops = (o.poops || []).slice(0, 4).map(p => ({ age: 0, counted: !!p.counted }));
-    s.asleep = false; s.lightsOff = false;
-    delete s.secretChecked;
+    s.asleep = false; s.lightsOff = false; s.napping = false; s.energy = C.ENERGY.MAX; s.job = null;
+    delete s.secretChecked; delete s.lightMs; delete s.lightMistake;
     s.createdAt = Date.now() - s.eggMs - s.ageMs;
-    s.lastSaved = Date.now();         // don't replay time spent away under the old rules
+    s.simT = s.eggMs + s.ageMs;       // time spent away under the old rules is not replayed
     s.v = C.SAVE_VERSION; s.migratedFrom = o.v || 1; s.migratedStage = V1_STAGE[oldForm] || null;
     return s;
   }
 
   const Pet = {
-    create, randomName, makeSick, migrate, isNight, clockHour,
+    create, randomName, makeSick, migrate, clockHour, addXp,
     /** Advance the simulation by `ms` game-milliseconds. opts.away = catching up on time away (softened needs). */
     simulate(s, ms, ev, opts) {
       ev = ev || [];
@@ -210,8 +222,8 @@
     evolve(s, to, ev) { evolve(s, to, ev || []); },
     /** Move the pet's clock so that it currently reads `hour` (debug/tests). */
     setClock(s, hour) {
-      const d = new Date(); d.setHours(Math.floor(hour), Math.round((hour % 1) * 60), 0, 0);
-      s.createdAt = d.getTime() - s.eggMs - s.ageMs;
+      let d = hour - clockHour(s); d = ((d % 24) + 24) % 24;
+      s.createdAt += Math.round(d * TT.HOUR);
     },
     /** Game ms until the next evolution (null if none). Can be <= 0 when it's due (waiting for the pet to wake). */
     evolvesIn(s) {
@@ -220,11 +232,20 @@
       return at == null ? null : at - s.ageMs;
     },
     level(s) { return T.Battle.levelFromXp(s.xp); },
-    needsAttention(s) {
-      if (s.dead || s.stage === 'egg') return false;
-      if (s.asleep) return !s.lightsOff;
-      return s.hunger === 0 || s.happy === 0 || s.sick || s.fakeCall || s.poops.length >= 3;
+    /** What needs the player's attention right now: [{id, text}] (the bell / attention panel). */
+    attention(s) {
+      const out = [];
+      if (s.dead || s.stage === 'egg') return out;
+      if (s.job) return out;
+      if (s.sick) out.push({ id: 'sick', text: 'Sick - needs medicine' });
+      if (s.hunger <= 1) out.push({ id: 'hungry', text: s.hunger ? 'Hungry' : 'Starving!' });
+      if (s.poops.length) out.push({ id: 'poop', text: s.poops.length + ' poop' + (s.poops.length > 1 ? 's' : '') + ' to clean' });
+      if (s.happy <= 1) out.push({ id: 'sad', text: s.happy ? 'Bored - train or give a treat' : 'Miserable!' });
+      if (s.fakeCall) out.push({ id: 'fake', text: 'Acting up for no reason - scold it' });
+      if (!s.asleep && s.energy < 20) out.push({ id: 'tired', text: 'Low energy (' + Math.floor(s.energy) + ') - lights off to sleep' });
+      return out;
     },
+    needsAttention(s) { return this.attention(s).length > 0; },
     minWeight(s) { return C.MIN_WEIGHT[s.stage] || 5; },
 
     // ---------- care actions (return a result keyword for the UI) ----------
@@ -237,7 +258,13 @@
       if (s.recentSnacks >= 5 && Math.random() < 0.4) { makeSick(s); return 'sick'; }
       return 'ok';
     },
-    setLights(s, on) { s.lightsOff = !on; },
+    /** Lights off = the pet goes to sleep (and recharges); lights on = it wakes up. */
+    setLights(s, on) {
+      s.lightsOff = !on;
+      if (on && s.asleep) { s.asleep = false; s.napping = false; return 'wake'; }
+      if (!on && !s.asleep && !s.job) { s.asleep = true; s.napping = false; return 'sleep'; }
+      return 'ok';
+    },
     clean(s) { const n = s.poops.length; s.poops = []; return n ? 'ok' : 'none'; },
     medicine(s) {
       if (!s.sick) return 'refuse';
@@ -252,42 +279,28 @@
       }
       s.happy = Math.max(0, s.happy - 1); return 'unfair';
     },
-    /** Training session finished with `hits` of 5. Returns {result, xp, level, levelUp}. */
-    playDone(s, hits) {
+    /** Training session finished with `hits` of 5. mult = daily XP taper. Returns {result, xp, level, levelUp...}. */
+    playDone(s, hits, mult) {
       s.plays++; count(s, 'training');
       s.weight = Math.max(this.minWeight(s), s.weight - 1);
-      const x = addXp(s, T.Battle.trainXp(hits));
+      const x = addXp(s, T.Battle.trainXp(hits, this.level(s)), mult);
       if (hits >= 3) s.happy = Math.min(4, s.happy + 1);
       return Object.assign({ result: hits >= 3 ? 'win' : 'lose' }, x);
     },
-    /** Battle finished. result: 'win' | 'loss' | 'fled'. Returns {xp, level, levelUp}. */
-    battleDone(s, result, foeLevel) {
+    /** Battle finished. result: 'win' | 'loss' | 'fled'. mult = daily XP taper. Returns {xp, level, levelUp...}. */
+    battleDone(s, result, foeLevel, mult) {
       const won = result === 'win';
       count(s, 'battles'); if (won) count(s, 'wins'); else count(s, 'losses');
       if (won) s.happy = Math.min(4, s.happy + 1);
       s.weight = Math.max(this.minWeight(s), s.weight - 1);
-      return addXp(s, T.Battle.battleXp(result, this.level(s), foeLevel));
+      return addXp(s, T.Battle.battleXp(result, this.level(s), foeLevel), mult);
     },
 
-    // ---------- persistence ----------
-    save(s) {
-      s.lastSaved = Date.now();
-      try { localStorage.setItem(C.SAVE_KEY, JSON.stringify(s)); } catch (e) {}
-    },
-    load() {
-      try {
-        const raw = localStorage.getItem(C.SAVE_KEY);
-        if (!raw) return null;
-        const o = JSON.parse(raw);
-        if (!o || typeof o !== 'object') return null;
-        const s = (o.v || 1) < C.SAVE_VERSION ? migrate(o) : Object.assign(create(), o);
-        if (T.LEGACY_FORMS[s.formId]) { s.formId = T.LEGACY_FORMS[s.formId]; s.stage = T.FORMS[s.formId].stage; }
-        if (!Object.prototype.hasOwnProperty.call(T.FORMS, s.formId)) return null;
-        s.st = Object.assign(T.Evolution.blankStageStats(), s.st || {});
-        return s;
-      } catch (e) { return null; }
-    },
-    wipe() { try { localStorage.removeItem(C.SAVE_KEY); } catch (e) {} }
+    /** The old browser-only save, if this device has one (offered once for import into an account). */
+    readLocalSave() {
+      try { const raw = localStorage.getItem(C.SAVE_KEY); const o = raw && JSON.parse(raw); return o && typeof o === 'object' ? o : null; }
+      catch (e) { return null; }
+    }
   };
   T.Pet = Pet;
 })(window.Tama);

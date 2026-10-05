@@ -1,6 +1,7 @@
-/* TAMA-PIX — hidden debug panel. Open the page with ?debug=1 (optionally &speed=60 to speed time up).
- * Time jumps, need/sickness toggles, stage counters, forcing any evolution branch (with a preview of the
- * target and which branch the current counters would pick), and a gallery of the whole evolution tree.
+/* TAMA-PIX — hidden debug panel. Open the page with ?debug=1. The pet lives on the server, so every tool here is a
+ * server op (POST /api/debug) that only works when the server was started with DEBUG=1 (never in production).
+ * Time jumps, need/sickness toggles, energy/coins, stage counters, forcing any evolution branch (with a preview
+ * of the target and which branch the current counters would pick), and a gallery of the whole evolution tree.
  */
 (function (T) {
   'use strict';
@@ -15,7 +16,8 @@
       panel.id = 'debug'; panel.className = 'collapsed';
       panel.innerHTML = `
         <h3 id="dbgToggle" title="click to expand/collapse">&#9881; DEBUG <small>(click to toggle)</small></h3>
-        <div class="row"><label>Speed x<input id="dbgSpeed" type="number" min="0.1" step="1" value="${C.SPEED}"></label>
+        <div class="row"><small id="dbgNote">Time tools run on the server and only work when it was started with DEBUG=1.</small></div>
+        <div class="row"><label>Server speed x<input id="dbgSpeed" type="number" min="1" step="1" value="1"></label>
           <small>(1 = real time)</small></div>
         <div class="row">
           <button data-d="hatch">Hatch</button>
@@ -32,8 +34,13 @@
           <button data-d="xp">+100 XP</button>
         </div>
         <div class="row">
-          <button data-d="day12">Clock 12:00</button>
-          <button data-d="night">Clock 23:00 (sleep)</button>
+          <button data-d="e0">Energy 0</button>
+          <button data-d="efull">Energy full</button>
+          <button data-d="coins">+500 coins</button>
+          <button data-d="finish">Finish job</button>
+          <button data-d="newday">New day</button>
+        </div>
+        <div class="row">
           <button data-d="kill">Kill</button>
           <button data-d="reset">New egg</button>
           <button data-d="gallery">Evolution tree</button>
@@ -57,67 +64,72 @@
       Object.keys(T.FORMS).forEach(k => sel.insertAdjacentHTML('beforeend', `<option value="${k}">${T.FORMS[k].name} (${k}, ${T.FORMS[k].stage})</option>`));
       const bsel = panel.querySelector('#dbgBranch');
       bsel.addEventListener('change', () => Debug.previewTarget(panel));
-
       const read = () => {
-        STAGE_VARS.forEach(k => { panel.querySelector(`[data-st="${k}"]`).value = G.state.st[k] || 0; });
-        PET_VARS.forEach(k => { panel.querySelector(`[data-v="${k}"]`).value = G.state[k]; });
+        const s = G.state; if (!s) return;
+        STAGE_VARS.forEach(k => { panel.querySelector(`[data-st="${k}"]`).value = (s.st && s.st[k]) || 0; });
+        PET_VARS.forEach(k => { panel.querySelector(`[data-v="${k}"]`).value = Math.floor(s[k] || 0); });
       };
-      read();
-      panel.querySelector('#dbgSpeed').addEventListener('change', e => { C.SPEED = Math.max(0.1, parseFloat(e.target.value) || 1); });
-      panel.querySelector('#dbgToggle').addEventListener('click', () => panel.classList.toggle('collapsed'));
+      Debug.read = read;
+      panel.querySelector('#dbgSpeed').addEventListener('change', e => Debug.op({ op: 'speed', speed: Math.max(1, parseFloat(e.target.value) || 1) }));
+      panel.querySelector('#dbgToggle').addEventListener('click', () => { panel.classList.toggle('collapsed'); read(); });
       panel.addEventListener('click', e => {
         const d = e.target.dataset.d; if (!d) return;
         Debug.act(d, { form: sel.value, branch: bsel.value, panel });
-        if (d !== 'apply') read();
       });
       Debug.info(panel);
       setInterval(() => Debug.info(panel), 500);
     },
 
-    act(d, o) {
-      const G = T.Game, s = G.state, TT = C.T, ev = [];
-      const done = () => { G.handleEvents && G.handleEvents(ev, true); };
-      switch (d) {
-        case 'hatch': if (s.stage === 'egg') { s.eggMs = TT.HATCH - 200; } break;
-        case 'hour': T.Pet.simulate(s, TT.HOUR, ev); done(); break;
-        case 'day': T.Pet.simulate(s, TT.DAY, ev); done(); break;
-        case 'next': {
-          if (s.stage === 'egg') { s.eggMs = TT.HATCH - 200; break; }
-          const at = T.Evolution.nextAgeAt(s);
-          if (at != null && s.ageMs < at - 1500) { s.ageMs = at - 1500; T.Pet.setClock(s, 12); s.asleep = false; }
-          break;
-        }
-        case 'full': s.hunger = 4; s.happy = 4; break;
-        case 'empty': s.hunger = 0; s.happy = 0; break;
-        case 'poop': if (s.poops.length < 4) s.poops.push({ age: 0, counted: false }); break;
-        case 'sick': T.Pet.makeSick(s); break;
-        case 'fake': s.fakeCall = true; s.fakeCallMs = 0; break;
-        case 'xp': s.xp = (s.xp | 0) + 100; break;
-        case 'day12': T.Pet.setClock(s, 12); break;
-        case 'night': T.Pet.setClock(s, 23); if (s.ageMs < TT.NEWBORN_AWAKE) s.ageMs = TT.NEWBORN_AWAKE; break;
-        case 'kill': s.dead = true; s.cause = 'debug'; G.resetUI(); break;
-        case 'reset': G.newEgg(); break;
-        case 'apply':
-          STAGE_VARS.forEach(k => { const v = o.panel.querySelector(`[data-st="${k}"]`).value; if (v !== '') s.st[k] = Number(v); });
-          PET_VARS.forEach(k => { const v = o.panel.querySelector(`[data-v="${k}"]`).value; if (v !== '') s[k] = Number(v); });
-          break;
-        case 'force': if (o.branch) Debug.force(o.branch, true); break;
-        case 'setform': Debug.force(o.form, false); break;
-        case 'gallery': Debug.gallery(); break;
-      }
-      G.render();
+    /** Send a debug op to the server (403 unless the server runs with DEBUG=1). */
+    async op(body) {
+      const note = document.getElementById('dbgNote');
+      try {
+        const r = await T.Api.post('/api/debug', body);
+        if (r.status !== 200) { if (note) note.textContent = (r.data && r.data.msg) || 'Debug op refused (' + r.status + ').'; return false; }
+        if (note) note.textContent = 'ok: ' + body.op;
+        if (r.data.state) T.Game.applyView(r.data.state);
+        if (Debug.read) Debug.read();
+        return true;
+      } catch (e) { if (note) note.textContent = 'Server unreachable.'; return false; }
     },
 
-    /** Turn the pet into `to` now (age moved to the start of that stage). anim = play the evolution animation. */
-    force(to, anim) {
-      const G = T.Game, s = G.state, from = s.formId;
-      if (s.stage === 'egg') { s.eggMs = C.T.HATCH; T.Pet.simulate(s, 1000); }
-      T.Pet.evolve(s, to);
-      const entry = T.Evolution.entryAge(to);
-      if (entry != null && s.ageMs < entry) { s.ageMs = entry + 1000; T.Pet.setClock(s, 12); s.asleep = false; }
-      G.resetUI();
-      if (anim) G.evolveAnim(from, to);
+    act(d, o) {
+      const TT = C.T, s = T.Game.state || {};
+      const P = (pet, eco) => Debug.op({ op: 'patch', pet, eco });
+      switch (d) {
+        case 'hatch': return Debug.op({ op: 'hatch' });
+        case 'hour': return Debug.op({ op: 'skip', ms: TT.HOUR });
+        case 'day': return Debug.op({ op: 'skip', ms: TT.DAY });
+        case 'next': return Debug.op({ op: 'next' });
+        case 'full': return P({ hunger: 4, happy: 4 });
+        case 'empty': return P({ hunger: 0, happy: 0 });
+        case 'poop': return Debug.op({ op: 'poop' });
+        case 'sick': return Debug.op({ op: 'sick' });
+        case 'fake': return Debug.op({ op: 'fake' });
+        case 'xp': return P({ xp: (s.xp | 0) + 100 });
+        case 'e0': return P({ energy: 0 });
+        case 'efull': return P({ energy: C.ENERGY.MAX, asleep: false, napping: false });
+        case 'coins': return P(null, { coins: ((T.Game.eco && T.Game.eco.coins) || 0) + 500 });
+        case 'finish': return Debug.op({ op: 'finish_job' });
+        case 'newday': return Debug.op({ op: 'new_day' });
+        case 'kill': return Debug.op({ op: 'kill' });
+        case 'reset': return Debug.op({ op: 'reset' });
+        case 'read': return Debug.read && Debug.read();
+        case 'apply': {
+          const st = {}, pet = {};
+          STAGE_VARS.forEach(k => { const v = o.panel.querySelector(`[data-st="${k}"]`).value; if (v !== '') st[k] = Number(v); });
+          PET_VARS.forEach(k => { const v = o.panel.querySelector(`[data-v="${k}"]`).value; if (v !== '') pet[k] = Number(v); });
+          pet.st = st;
+          return P(pet);
+        }
+        case 'force': if (o.branch) return Debug.force(o.branch, true); break;
+        case 'setform': return Debug.force(o.form, false);
+        case 'gallery': Debug.gallery(); break;
+      }
     },
+
+    /** Turn the pet into `to` now (on the server). anim = play the evolution animation. */
+    force(to, anim) { T.Game.resetUI(); return Debug.op({ op: 'force', form: to, anim: !!anim }); },
 
     /** Test helper: hatch, set the baby-stage counters, evolve at day 2, set day 2-5 counters, evolve at day 5.
      *  pet = extra fields on the pet (discipline, weight...) applied before each evolution. Returns the history. */
@@ -146,6 +158,7 @@
 
     info(panel) {
       const s = T.Game.state, p = panel.querySelector('#dbgInfo');
+      if (!s || !s.st) return;
       // branch list for the current form with the current verdicts
       const pv = T.Evolution.preview(s), bsel = panel.querySelector('#dbgBranch');
       const key = s.formId + ':' + pv.map(b => b.to).join(',');
@@ -158,8 +171,9 @@
         : '<div class="no">final form - no more evolutions</div>';
       const left = T.Pet.evolvesIn(s), v = T.Evolution.vars(s);
       p.textContent = `form ${T.FORMS[s.formId].name} (${s.formId}, ${s.stage})  age ${(s.ageMs / C.T.HOUR).toFixed(2)} h
-next evolution ${left == null ? '-' : (left / C.T.HOUR).toFixed(2) + ' h game / ' + (left / C.T.HOUR / C.SPEED).toFixed(2) + ' h real'}
-clock ${T.Pet.clockHour(s).toFixed(2)}  asleep ${s.asleep}  lightsOff ${s.lightsOff}
+next evolution ${left == null ? '-' : (left / C.T.HOUR).toFixed(2) + ' h'}
+energy ${Math.floor(s.energy)}  asleep ${s.asleep}  napping ${s.napping}  lightsOff ${s.lightsOff}  job ${s.job ? s.job.id : '-'}
+coins ${T.Game.eco ? T.Game.eco.coins : '-'}  actions today ${T.Game.eco ? T.Game.eco.daily.actions : '-'}
 Lv ${T.Pet.level(s)} (xp ${s.xp})  hunger ${s.hunger} happy ${s.happy} weight ${s.weight} disc ${s.discipline}
 poops ${s.poops.length} sick ${s.sick}  mistakes ${s.careMistakes} (poop ${s.poopMistakes})
 life: battles ${s.battles} wins ${s.wins} training ${s.training}

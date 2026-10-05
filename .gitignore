@@ -6,3 +6,8 @@ screenshots/
 .DS_Store
 __pycache__/
 *.pyc
+server/data/
+
+server/server.log
+server/*.log
+server/data/

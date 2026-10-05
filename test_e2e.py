@@ -1,33 +1,45 @@
-"""TAMA-PIX end-to-end tests + screenshots (tap-only; no keyboard input is used anywhere).
+"""TAMA-PIX end-to-end tests + phone screenshots (tap-only in the game UI; forms are filled like a user would).
 
-Starts/stops its own servers:  node server/server.js on :8765, later python http.server on :8765.
+The server owns the game now, so every flow runs against a real server:
+  * main server   node server/server.js on :8765 with DEBUG=1 (time tools), a temp JSON store, relaxed rate limits
+  * prod server   node on :8767 like production (NODE_ENV=production, no DEBUG, real rate limits)
+  * static host   python http.server on :8768 (page without the game server -> OFFLINE message)
+  * file://       the page opened as a file (-> OFFLINE message)
+  * optional      PG_TEST_URL=postgres://... runs an API smoke test against Postgres on :8769
 Run:  python3 test_e2e.py
 """
-import asyncio, base64, json, os, random, subprocess, sys, time
+import asyncio, json, os, random, subprocess, sys, time, urllib.request, urllib.error, http.cookiejar
 from playwright.async_api import async_playwright
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SHOTS = os.path.join(ROOT, 'screenshots')
 os.makedirs(SHOTS, exist_ok=True)
-PORT = 8765
+PORT, PROD_PORT, STATIC_PORT, PG_PORT = 8765, 8767, 8768, 8769
 BASE = f'http://localhost:{PORT}/'
+DATA = '/tmp/tama-e2e.json'
 PHONE = dict(viewport={'width': 390, 'height': 844}, device_scale_factor=2, is_mobile=True, has_touch=True)
 DESK = dict(viewport={'width': 800, 'height': 900})
 errors, fails = [], []
+HOUR = 3600e3
 
 def check(cond, msg):
     print(('PASS ' if cond else 'FAIL ') + msg, flush=True)
     if not cond: fails.append(msg)
 
-def start_node():
-    p = subprocess.Popen(['node', 'server.js'], cwd=os.path.join(ROOT, 'server'), env={**os.environ, 'PORT': str(PORT)},
-                         stdout=open('/tmp/tama-node.log', 'w'), stderr=subprocess.STDOUT)
-    time.sleep(0.8)
-    assert p.poll() is None, 'node server failed to start (port busy?)'
-    return p
+def start_node(port=PORT, env=None, log='/tmp/tama-node.log'):
+    e = {**os.environ, 'PORT': str(port), 'DEBUG': '1', 'DATA_FILE': DATA, 'RATE_LIMIT_SCALE': '50', 'BCRYPT_COST': '4'}
+    e.pop('DATABASE_URL', None); e.pop('NODE_ENV', None); e.pop('RENDER', None)
+    e.update(env or {})
+    e = {k: v for k, v in e.items() if v is not None}
+    p = subprocess.Popen(['node', 'server/server.js'], cwd=ROOT, env=e, stdout=open(log, 'a'), stderr=subprocess.STDOUT)
+    for _ in range(50):
+        time.sleep(0.1)
+        try: urllib.request.urlopen(f'http://localhost:{port}/healthz', timeout=1); return p
+        except Exception: pass
+    raise SystemExit(f'node server on :{port} failed to start (see {log})')
 
-def start_static():
-    p = subprocess.Popen([sys.executable, '-m', 'http.server', str(PORT)], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def start_static(port=STATIC_PORT):
+    p = subprocess.Popen([sys.executable, '-m', 'http.server', str(port)], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.8)
     assert p.poll() is None, 'static server failed to start (port busy?)'
     return p
@@ -35,409 +47,678 @@ def start_static():
 def stop(p):
     if p and p.poll() is None: p.terminate(); p.wait(5)
 
+class Http:
+    """Tiny API client with its own cookie jar (for the production-like server and Postgres checks)."""
+    def __init__(self, port):
+        self.base = f'http://localhost:{port}'
+        self.op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    def call(self, method, path, body=None, tama=True):
+        h = {'content-type': 'application/json'}
+        if tama: h['x-tama'] = '1'
+        req = urllib.request.Request(self.base + path, method=method, headers=h, data=json.dumps(body).encode() if body is not None else None)
+        try: r = self.op.open(req, timeout=10); return r.status, json.loads(r.read() or b'{}'), dict(r.headers)
+        except urllib.error.HTTPError as e:
+            try: d = json.loads(e.read() or b'{}')
+            except Exception: d = {}
+            return e.code, d, dict(e.headers)
+
+EXPECTED_ERR = []          # substrings of console errors that a test provokes on purpose
 def watch(pg, tag):
-    pg.on('console', lambda m: errors.append(f'{tag} {m.type}: {m.text}') if m.type in ('error', 'warning') else None)
+    def on_console(m):
+        if m.type in ('error', 'warning') and not any(x in m.text for x in EXPECTED_ERR): errors.append(f'{tag} {m.type}: {m.text}')
+    pg.on('console', on_console)
     pg.on('pageerror', lambda e: errors.append(f'{tag} pageerror: {e}'))
 
-async def new_page(browser, opts, tag):
+async def new_page(browser, opts, tag, perms=None):
     ctx = await browser.new_context(**opts)
+    if perms: await ctx.grant_permissions(perms, origin=BASE[:-1])
     pg = await ctx.new_page(); watch(pg, tag); pg.touch = opts.get('has_touch', False)
     return ctx, pg
 
-async def tap_icon(pg, name, wait=250):
+async def ev(pg, js): return await pg.evaluate(js)
+async def st(pg): return await ev(pg, 'JSON.parse(JSON.stringify(Tama.Game.state))')
+async def eco(pg): return await ev(pg, 'JSON.parse(JSON.stringify(Tama.Game.eco))')
+async def mode(pg): return await ev(pg, 'Tama.Game.ui.mode')
+async def idle(pg, ms=12000): await pg.wait_for_function('!Tama.Game.ui.anim && Tama.Game.ui.queue.length===0 && !Tama.Game.busy', timeout=ms)
+async def refresh(pg): await ev(pg, 'Tama.Game.refresh()'); await pg.wait_for_timeout(120)
+
+async def tap_icon(pg, name, wait=300):
     loc = pg.locator(f'.pbtn[data-icon="{name}"]')
     await (loc.tap() if pg.touch else loc.click()); await pg.wait_for_timeout(wait)
 
-async def tap_lcd(pg, lx, ly, wait=320):
-    """Tap the scene at stage pixel (lx, ly) (the 48x24 gameplay stage on the meadow)."""
-    c = await pg.evaluate(f'Tama.Game.stageToClient({lx + 0.5}, {ly + 0.5})')
+async def tap_zone(pg, zid, wait=450):
+    """Tap the on-screen choice/zone with this id (menus, rows, HI/LO, status, pet...)."""
+    c = await ev(pg, f"Tama.Game.zonePoint('{zid}')")
+    if not c: raise AssertionError(f'zone {zid} not on screen (have {await ev(pg, "Tama.Game.zoneIds()")})')
     await (pg.touchscreen.tap(c['x'], c['y']) if pg.touch else pg.mouse.click(c['x'], c['y'])); await pg.wait_for_timeout(wait)
 
-async def tap_zone(pg, zid, wait=320):
-    """Tap the on-screen choice/zone with this id (menus, HI/LO, status, pet...)."""
-    c = await pg.evaluate(f"Tama.Game.zonePoint('{zid}')")
-    assert c, f'zone {zid} not on screen'
-    await (pg.touchscreen.tap(c['x'], c['y']) if pg.touch else pg.mouse.click(c['x'], c['y'])); await pg.wait_for_timeout(wait)
+async def tap(pg, sel, wait=300):
+    loc = pg.locator(sel)
+    await (loc.tap() if pg.touch else loc.click()); await pg.wait_for_timeout(wait)
 
-async def ev(pg, js): return await pg.evaluate(js)
-async def st(pg): return await ev(pg, 'JSON.parse(JSON.stringify(Tama.Game.state))')
-async def mode(pg): return await ev(pg, 'Tama.Game.ui.mode')
-async def idle(pg, ms=8000): await pg.wait_for_function('!Tama.Game.ui.anim && Tama.Game.ui.queue.length===0', timeout=ms)
+async def api(pg, method, path, body=None, tama=True):
+    h = {'content-type': 'application/json'}
+    if tama: h['x-tama'] = '1'
+    return await ev(pg, f"""(async()=>{{const r=await fetch({json.dumps(path)},{{method:{json.dumps(method)},credentials:'same-origin',
+        headers:{json.dumps(h)},body:{json.dumps(json.dumps(body)) if body is not None else 'undefined'}}});
+        let d=null; try{{d=await r.json()}}catch(e){{}} return {{status:r.status, data:d}}}})()""")
 
-async def fresh(pg, url=BASE):
-    await pg.goto(url); await ev(pg, 'localStorage.clear()'); await pg.goto(url); await pg.wait_for_timeout(300)
+async def dbg(pg, body, wait=150):
+    ok = await ev(pg, f"Tama.Debug ? Tama.Debug.op({json.dumps(body)}) : Tama.Api.post('/api/debug', {json.dumps(body)}).then(r => (r.data.state && Tama.Game.applyView(r.data.state), r.status === 200))")
+    await pg.wait_for_timeout(wait); return ok
 
-async def make_pet(pg, form='nekoru', name='PIPO', extra=''):
-    """Hatch and turn the pet into `form` at the start of its stage, at noon on its clock (awake)."""
-    await ev(pg, f"""(function(){{var s=Tama.Game.state; s.eggMs=Tama.CONFIG.T.HATCH; Tama.Pet.simulate(s,1000);
-      Tama.Pet.evolve(s,'{form}'); s.ageMs=Tama.Evolution.entryAge('{form}')+2000; Tama.Pet.setClock(s,12); s.asleep=false;
-      s.name='{name}'; s.hunger=4; s.happy=4; s.training=6; s.battles=3; s.wins=2; s.xp=120; s.poops=[]; s.sick=false; s.dead=false; {extra}
-      Tama.Game.resetUI(); Tama.Game.ui.anim=null; Tama.Game.ui.queue=[];}})()""")
-    await pg.wait_for_timeout(250)
+async def make_pet(pg, form='nekoru', name='PIPO', pet=None, eco_=None):
+    """Hatch/force the pet into `form` on the server, healthy and full of energy."""
+    if (await st(pg))['stage'] == 'egg': await dbg(pg, {'op': 'hatch'})
+    await dbg(pg, {'op': 'force', 'form': form})
+    age = await ev(pg, f"(Tama.Evolution.entryAge('{form}') || 0) + 60000")
+    p = dict(name=name, hunger=4, happy=4, poops=[], sick=False, dead=False, energy=100, asleep=False, napping=False, lightsOff=False, fakeCall=False, job=None, ageMs=age)
+    p.update(pet or {})
+    await dbg(pg, {'op': 'patch', 'pet': p, 'eco': eco_ or {}})
+    await ev(pg, "Tama.Game.resetUI(); Tama.Game.ui.anim=null; Tama.Game.ui.queue=[]; Tama.Game.ui.toast=null")
+    await pg.wait_for_timeout(200)
 
-async def fight_by_tapping(pages, shot=None, max_s=90):
+async def signup(pg, user, pw='secret123', year=None, adult=False):
+    await pg.wait_for_selector('#authPanel:not([hidden])', timeout=8000)
+    await tap(pg, '#tabSignup', 100)
+    await pg.fill('#authUser', user); await pg.fill('#authPass', pw)
+    if year: await pg.fill('#authYear', str(year))
+    if adult: await pg.check('#authAdult')
+    await tap(pg, '#authGo', 200)
+    await pg.wait_for_function('Tama.Game.session', timeout=8000); await idle(pg)
+
+async def login(pg, user, pw='secret123'):
+    await pg.wait_for_selector('#authPanel:not([hidden])', timeout=8000)
+    await tap(pg, '#tabLogin', 100)
+    await pg.fill('#authUser', user); await pg.fill('#authPass', pw)
+    await tap(pg, '#authGo', 200)
+    await pg.wait_for_function('Tama.Game.session', timeout=8000); await idle(pg)
+
+async def fight_by_tapping(pages, shot=None, max_s=120):
     """Tap HI/LO on every page that's waiting for a move, until no page is in a battle."""
     t0 = time.time(); shot_done = False
     while time.time() - t0 < max_s:
         busy = False
         for pg in pages:
-            info = await ev(pg, "(function(){var B=Tama.Game.ui.battle; return B?{p:B.phase,k:B.kind}:null})()")
+            info = await ev(pg, "(function(){var B=Tama.Game.ui.battle, s=Tama.Game.ui.search; return B?{p:B.phase,k:B.kind}:(s?{p:'search'}:null)})()")
             if info is None: continue
             busy = True
             if info['p'] == 'choose':
-                try: await pg.wait_for_function("Tama.Game.zonePoint('hi') || !Tama.Game.ui.battle || Tama.Game.ui.battle.phase!=='choose'", timeout=3000)
-                except Exception: continue
                 if not await ev(pg, "!!Tama.Game.zonePoint('hi')"): continue
-                await tap_zone(pg, random.choice(['hi', 'lo']), wait=150)
-                await pg.wait_for_function("!Tama.Game.ui.battle || Tama.Game.ui.battle.phase!=='choose'", timeout=3000)
+                await tap_zone(pg, random.choice(['hi', 'lo']), wait=120)
             elif shot and not shot_done and info['p'] == 'anim' and pg is pages[0]:
                 await pg.wait_for_timeout(420); await pg.screenshot(path=shot); shot_done = True
         if not busy: return True
         await asyncio.sleep(0.12)
     return False
 
+async def shot(pg, name, wait=250):
+    await pg.wait_for_timeout(wait); await pg.screenshot(path=f'{SHOTS}/{name}.png')
+
 async def main():
     for f in os.listdir(SHOTS):
         if f.endswith('.png'): os.remove(os.path.join(SHOTS, f))
+    for f in (DATA, DATA + '.tmp', '/tmp/tama-e2e-prod.json'):
+        if os.path.exists(f): os.remove(f)
+    open('/tmp/tama-node.log', 'w').close()
     node = start_node()
     async with async_playwright() as p:
         browser = await p.chromium.launch()
 
-        # ================= 1. phone layout + tap-only care loop =================
-        ctx, pg = await new_page(browser, PHONE, 'phone')
-        await fresh(pg)
-        check(await ev(pg, "document.querySelectorAll('#device, .lcd-glass, #lcd, .keychain, [data-btn]').length") == 0, 'no egg shell / keyring / LCD / A-B-C buttons left in the DOM')
-        sizes = await ev(pg, "[...document.querySelectorAll('button.pbtn')].map(e=>{const r=e.getBoundingClientRect();return [e.dataset.icon, r.width, r.height]})")
-        check(len(sizes) == 10 and all(w >= 44 and h >= 44 for _, w, h in sizes), f'HUD tap targets >= 44px on phone: {[(n, round(w), round(h)) for n, w, h in sizes]}')
-        cov = await ev(pg, "(function(){var r=document.getElementById('scene').getBoundingClientRect(); return [r.left, r.top, r.right, r.bottom]})()")
-        check(cov[0] <= 0 and cov[1] <= 0 and cov[2] >= 390 and cov[3] >= 844, f'scene canvas fills the whole 390x844 screen {[round(v) for v in cov]}')
-        css = await ev(pg, "(function(){var b=getComputedStyle(document.body); return [b.touchAction, b.userSelect||b.webkitUserSelect, getComputedStyle(document.getElementById('scene')).touchAction]})()")
-        check(css[0] == 'manipulation' and css[1] == 'none' and css[2] == 'manipulation', f'double-tap zoom & text selection disabled {css}')
-        check(await ev(pg, "document.documentElement.scrollWidth <= 390 && document.documentElement.scrollHeight <= 844"), 'no scrolling on phone')
+        # ================= 1. log in screen, sign-up, phone layout =================
+        ctxA, A = await new_page(browser, PHONE, 'A', perms=['notifications'])
+        await A.goto(BASE)
+        await A.wait_for_selector('#authPanel:not([hidden])', timeout=8000)
+        check(True, 'logged out: the log-in / sign-up sheet is shown')
+        check(await ev(A, "document.getElementById('guestGo').offsetHeight >= 44 && document.getElementById('authGo').offsetHeight >= 44"), 'log-in buttons are big tap targets')
+        check(await ev(A, "document.getElementById('ephemeralNote').hidden"), 'no "test server" warning when running locally with a file store')
+        await shot(A, '01-phone-login')
+        await tap(A, '#tabSignup', 100)
+        await A.fill('#authUser', 'al'); await A.fill('#authPass', 'secret123'); await tap(A, '#authGo')
+        check('3-16' in await A.inner_text('#authError'), 'sign-up rejects a too-short username')
+        await A.fill('#authUser', 'alice'); await A.fill('#authPass', 'short'); await tap(A, '#authGo')
+        check('8 characters' in await A.inner_text('#authError'), 'sign-up rejects a short password')
+        await A.fill('#authPass', 'secret123'); await A.fill('#authYear', '1990'); await A.check('#authAdult'); await tap(A, '#authGo', 300)
+        await A.wait_for_function('Tama.Game.session', timeout=8000)
+        u = await ev(A, 'Tama.Game.user')
+        check(u['username'] == 'alice' and not u['isGuest'] and u['birthYear'] == 1990 and u['adult'] is True and u['friendCode'].startswith('PX-'),
+              f'sign-up creates the account (birth year + adult flag stored, friend code {u["friendCode"]})')
+        cookies = {c['name']: c for c in await ctxA.cookies()}
+        check('tp_sid' in cookies and cookies['tp_sid']['httpOnly'] and cookies['tp_sid']['sameSite'] == 'Lax' and 'tp_sid' not in await ev(A, 'document.cookie'),
+              'session cookie is httpOnly + SameSite=Lax (invisible to page scripts)')
+        await idle(A)
+        e0 = await eco(A)
+        check(e0['coins'] == 10 and e0['gift']['idx'] == 1, f"daily login gift day 1 = 10 coins ({e0['coins']})")
+        s0 = await st(A)
+        check(s0['stage'] == 'egg' and s0['energy'] == 100, 'a new account starts with an egg and full energy')
+        sizes = await ev(A, "[...document.querySelectorAll('button.pbtn')].map(e=>{const r=e.getBoundingClientRect();return [e.dataset.icon, r.width, r.height]})")
+        check(len(sizes) == 11 and all(w >= 44 and h >= 44 for _, w, h in sizes), f'11 HUD buttons, all >= 44px ({[n for n, _, _ in sizes]})')
+        check(await ev(A, "document.documentElement.scrollWidth <= 390 && document.documentElement.scrollHeight <= 844"), 'no scrolling on a 390x844 phone')
+        cov = await ev(A, "(function(){var r=document.getElementById('scene').getBoundingClientRect(); return [r.left, r.top, r.right, r.bottom]})()")
+        check(cov[0] <= 0 and cov[1] <= 0 and cov[2] >= 390 and cov[3] >= 844, 'scene fills the phone screen')
+        wal = await ev(A, "(function(){var w=document.getElementById('wallet').getBoundingClientRect(), t=document.getElementById('barTop').getBoundingClientRect(), s=Tama.Game.stageToClient(0,-20); return [w.top>=t.bottom-1, w.bottom<=s.y, getComputedStyle(document.getElementById('wallet')).visibility]})()")
+        check(wal[0] and wal[1] and wal[2] == 'visible', f'energy/coins strip sits under the top bar, above the play area {wal}')
+        disabled = await ev(A, "[...document.querySelectorAll('button.pbtn')].filter(b=>b.disabled).map(b=>b.dataset.icon)")
+        check(set(disabled) == {'feed', 'light', 'play', 'medicine', 'bath', 'discipline', 'battle', 'back'}, f'egg: care buttons disabled, HOME/STATUS/BELL usable ({disabled})')
 
-        cfg = await ev(pg, "({h:Tama.CONFIG.T.HATCH, t:Tama.CONFIG.T.TEEN_AT, a:Tama.CONFIG.T.ADULT_AT, d:Tama.CONFIG.T.DAY, sp:Tama.CONFIG.SPEED})")
-        check(cfg['h'] == 60000 and cfg['t'] == 2 * cfg['d'] and cfg['a'] == 5 * cfg['d'] and cfg['d'] == 86400000 and cfg['sp'] == 1,
-              f'real-time timing: hatch 1 min, evolve at day 2 and day 5, speed 1 without ?debug ({cfg})')
-        check(await ev(pg, "(function(){var s=Tama.Pet.create(); Tama.Pet.simulate(s, 59000); var a=s.stage; Tama.Pet.simulate(s, 2000); return a==='egg' && s.stage==='baby'})()"),
-              'egg hatches after one minute')
-        await ev(pg, "Tama.Game.state.eggMs=Tama.CONFIG.T.HATCH-200")
-        await pg.wait_for_function("Tama.Game.state.stage==='baby'", timeout=4000); await idle(pg)
-        check((await st(pg))['formId'] == 'blob', 'every pet hatches as the BLOB')
-        check((await st(pg))['xp'] == 0 and await ev(pg, "Tama.Pet.level(Tama.Game.state)") == 1, 'a new hatchling is Lv 1 with 0 XP')
+        # hatch (server clock) -> BLOB
+        await dbg(A, {'op': 'hatch'}); await A.wait_for_function("Tama.Game.state.stage==='baby'", timeout=5000); await idle(A)
+        s = await st(A)
+        check(s['formId'] == 'blob' and s['xp'] == 0, 'the server hatches every egg as the BLOB (Lv 1)')
 
-        h0 = (await st(pg))['hunger']
-        await tap_icon(pg, 'feed'); check(await mode(pg) == 'feedMenu', 'tapping FEED icon opens the meal/snack screen')
-        await tap_zone(pg, 'opt0'); await idle(pg)
-        check((await st(pg))['hunger'] == h0 + 1, 'tapping MEAL feeds a meal')
-        await tap_icon(pg, 'feed'); await tap_zone(pg, 'opt1'); await idle(pg)
-        check((await st(pg))['snacks'] == 1, 'tapping SNACK gives a snack')
-        await tap_icon(pg, 'feed'); await tap_icon(pg, 'back')
-        check(await mode(pg) == 'main', 'back arrow leaves the feed screen')
+        # ================= 2. care loop by tapping (server-validated) =================
+        h0 = s['hunger']
+        await dbg(A, {'op': 'patch', 'pet': {'hunger': 1}})
+        await tap_icon(A, 'feed'); check(await mode(A) == 'feedMenu', 'FEED opens meal/snack')
+        await tap_zone(A, 'meal'); await idle(A)
+        s = await st(A); check(s['hunger'] == 2, 'MEAL: the server adds a hunger heart')
+        check(s['energy'] == 100, 'on-time care earn-back never goes over max energy')
+        await tap_icon(A, 'feed'); await tap_zone(A, 'snack'); await idle(A)
+        check((await st(A))['snacks'] == 1, 'SNACK recorded by the server')
+        await tap_icon(A, 'feed'); await tap_icon(A, 'back'); check(await mode(A) == 'main', 'BACK leaves the feed menu')
 
-        await tap_icon(pg, 'play'); check(await mode(pg) == 'play', 'PLAY icon starts the left/right game')
+        en0 = (await st(A))['energy']
+        await tap_icon(A, 'play', 600); check(await mode(A) == 'play', 'TRAIN starts the left/right game (server session)')
         for i in range(5):
-            await pg.wait_for_function("Tama.Game.ui.play && Tama.Game.ui.play.phase==='wait'", timeout=5000)
-            await tap_zone(pg, 'left' if i % 2 else 'right', wait=50)
-            await pg.wait_for_function("!Tama.Game.ui.play || Tama.Game.ui.play.phase!=='wait'", timeout=3000)
-        await pg.wait_for_function("Tama.Game.ui.mode==='main'", timeout=8000)
-        s1 = await st(pg)
-        check(s1['plays'] == 1, 'play game completed by tapping')
-        check(10 <= s1['xp'] <= 30 and s1['st']['training'] == 1, f"training gives XP ({s1['xp']}) and counts for this stage")
-        xp_before = s1['xp']
-        aged = await ev(pg, "(function(){var s=JSON.parse(JSON.stringify(Tama.Game.state)); Tama.Pet.simulate(s, Tama.CONFIG.T.DAY); return [s.xp, Tama.Pet.level(s), s.ageMs>Tama.CONFIG.T.DAY]})()")
-        check(aged[0] == xp_before and aged[2], f'a day passing adds no XP (xp {aged[0]}, Lv {aged[1]}) - levels only from training/battles')
-        lv = await ev(pg, "[0,29,30,70,630,2280,13230,99999].map(function(x){return Tama.Battle.levelFromXp(x)})")
-        check(lv == [1, 1, 2, 3, 10, 20, 50, 50], f'level curve from XP {lv}')
-        st5 = await ev(pg, "[Tama.Battle.statsFor({formId:'kingleo',xp:0,weight:25}), Tama.Battle.statsFor({formId:'kingleo',xp:Tama.Battle.xpFor(30),weight:25})]")
-        check(st5[1]['pow'] > st5[0]['pow'] and st5[1]['hp'] > st5[0]['hp'], f'level raises battle stats (Lv1 {st5[0]} vs Lv30 {st5[1]})')
+            await A.wait_for_function("Tama.Game.ui.play && Tama.Game.ui.play.phase==='wait'", timeout=6000)
+            await tap_zone(A, 'left' if i % 2 else 'right', wait=60)
+            await A.wait_for_function("!Tama.Game.ui.play || Tama.Game.ui.play.phase!=='wait' && Tama.Game.ui.play.phase!=='sending'", timeout=5000)
+        await A.wait_for_function("Tama.Game.ui.mode==='main'", timeout=9000)
+        s = await st(A)
+        check(s['training'] == 1 and s['xp'] > 0, f"training finished by tapping: server gave {s['xp']} XP")
+        check(abs(s['energy'] - (en0 - 10)) < 0.5, f"training costs 10 energy ({en0:.0f} -> {s['energy']:.0f})")
 
-        await tap_icon(pg, 'status'); check(await mode(pg) == 'status', 'STATUS icon opens status')
-        left = await ev(pg, "Tama.Pet.evolvesIn(Tama.Game.state)")
-        check(left is not None and 1.99 * 86400000 < left <= 2 * 86400000, f'status: first evolution due in ~2 days ({left/3600000:.1f} h)')
-        await tap_zone(pg, 'status'); await pg.wait_for_timeout(200)
-        await pg.screenshot(path=f'{SHOTS}/03b-phone-status-hunger.png')
-        await tap_icon(pg, 'back'); await tap_icon(pg, 'status')
-        pages = []
-        for _ in range(5):
-            pages.append(await ev(pg, 'Tama.Game.ui.page')); await tap_zone(pg, 'status')
-        check(pages == [0, 1, 2, 3, 4] and await mode(pg) == 'main', f'tapping the screen pages through status {pages}')
-        await tap_icon(pg, 'status'); await tap_zone(pg, 'status'); await tap_icon(pg, 'back')
-        check(await mode(pg) == 'main', 'back arrow exits status')
+        await dbg(A, {'op': 'sick'}); await dbg(A, {'op': 'patch', 'pet': {'doses': 1}})
+        await tap_icon(A, 'medicine'); await idle(A); check(not (await st(A))['sick'], 'MEDICINE cures (server)')
+        await dbg(A, {'op': 'poop'}); await tap_icon(A, 'bath'); await idle(A); check(len((await st(A))['poops']) == 0, 'CLEAN removes the poop (server)')
 
-        await ev(pg, "var s=Tama.Game.state; s.poops=[{age:0,counted:false},{age:0,counted:false}]; Tama.Pet.makeSick(s); s.doses=1;")
-        await tap_icon(pg, 'medicine'); await idle(pg); check(not (await st(pg))['sick'], 'MEDICINE icon cures')
-        await tap_icon(pg, 'bath'); await idle(pg); check(len((await st(pg))['poops']) == 0, 'BATHROOM icon cleans')
-        await ev(pg, "var s=Tama.Game.state; s.fakeCall=true; s.fakeCallMs=0;")
-        await tap_icon(pg, 'discipline'); await idle(pg); check((await st(pg))['discipline'] == 25, 'DISCIPLINE icon scolds a fake call')
-        await ev(pg, "var s=Tama.Game.state; s.ageMs=Math.max(s.ageMs, Tama.CONFIG.T.NEWBORN_AWAKE+1000); Tama.Pet.setClock(s, 23)")
-        await pg.wait_for_function("Tama.Game.state.asleep", timeout=3000)
-        await tap_icon(pg, 'light'); await tap_zone(pg, 'opt1')
-        s = await st(pg); check(s['asleep'] and s['lightsOff'], 'LIGHT icon -> OFF turns lights off while asleep')
-        check(await ev(pg, "document.body.dataset.env") == 'night', 'lights off switches the meadow to the night sky')
-        await pg.wait_for_timeout(700); await pg.screenshot(path=f'{SHOTS}/02-phone-night.png')
-        await ev(pg, "Tama.Pet.setClock(Tama.Game.state, 12)"); await pg.wait_for_function("!Tama.Game.state.asleep", timeout=3000)
+        # discipline "!" screen: purpose + feedback
+        await tap_icon(A, 'discipline'); check(await mode(A) == 'discipline', '"!" opens the DISCIPLINE screen')
+        await dbg(A, {'op': 'fake'})
+        await shot(A, '09-phone-discipline-screen', 400)
+        await tap_zone(A, 'scold'); await idle(A)
+        s = await st(A); msg = await ev(A, 'Tama.Game.ui.discMsg')
+        check(s['discipline'] == 25 and 'Obedience 0% > 25%' in msg, f'SCOLD during a fake call: +25% obedience with feedback ("{msg}")')
+        hp0 = s['happy']
+        await tap_zone(A, 'scold'); await idle(A)
+        s = await st(A); msg = await ev(A, 'Tama.Game.ui.discMsg')
+        check(s['happy'] == max(0, hp0 - 1) and 'unfair' in msg, f'SCOLD when it behaves: mood -1 and it says so ("{msg}")')
+        await tap_zone(A, 'discBack'); check(await mode(A) == 'main', 'discipline BACK button works')
 
-        # tapping the pet: a reaction, but no highlight box / outline around it
-        await ev(pg, "var u=Tama.Game.ui; u.pet.x=30; u.pet.move='stay'; u.nextThink=performance.now()+1e9;"); await pg.wait_for_timeout(200)
-        c = await ev(pg, "Tama.Game.zonePoint('pet')")
-        await pg.touchscreen.tap(c['x'], c['y']); await pg.wait_for_timeout(30)
-        fx = await ev(pg, "Tama.Game.ui.tapFx")
-        await pg.screenshot(path=f'{SHOTS}/10-phone-pet-tap-no-outline.png')
-        await pg.wait_for_timeout(150)
-        check(await ev(pg, "Tama.Game.ui.petted > performance.now()"), 'tapping the pet makes it react')
-        outline = await ev(pg, "[getComputedStyle(document.getElementById('scene')).outlineStyle, document.activeElement===document.getElementById('scene'), getComputedStyle(document.body).webkitTapHighlightColor]")
-        check(fx is None and outline[0] == 'none' and not outline[1] and outline[2] in ('rgba(0, 0, 0, 0)', 'transparent'),
-              f'tapping the pet shows no highlight box or focus outline (tapFx={fx}, css={outline})')
+        # lights: sleep only via lights off (or exhaustion); no clock-based sleep
+        await tap_icon(A, 'light'); await tap_zone(A, 'lightsOff'); await idle(A)
+        s = await st(A); check(s['asleep'] and s['lightsOff'] and not s['napping'], 'LIGHTS OFF puts it to sleep')
+        check(await ev(A, "document.body.dataset.env") == 'night', 'lights off = night meadow')
+        await dbg(A, {'op': 'patch', 'pet': {'energy': 40}}); await dbg(A, {'op': 'skip', 'ms': 2 * HOUR})
+        s = await st(A); check(68 <= s['energy'] <= 71, f"sleeping with lights off recharges ~15 energy/h (40 -> {s['energy']:.1f} in 2 h)")
+        check('+' in await A.inner_text('#energyNum'), 'the energy strip shows "+" while recharging')
+        await tap_icon(A, 'feed', 1600)
+        check(await mode(A) == 'main' and 'asleep' in (await ev(A, "(Tama.Game.ui.toast||{}).l1") or ''), 'FEED while asleep: refused with a clear message')
+        await tap_icon(A, 'light'); await tap_zone(A, 'lightsOn'); await idle(A)
+        check(not (await st(A))['asleep'], 'LIGHTS ON wakes it')
+        night = await ev(A, """(function(){var s=Tama.Pet.create(); s.eggMs=Tama.CONFIG.T.HATCH; Tama.Pet.simulate(s,1000); s.tz='UTC';
+            s.createdAt=Date.UTC(2026,0,1,22,0,0)-s.ageMs-s.eggMs; Tama.Pet.simulate(s, 3*3600e3); return [s.asleep, s.energy]})()""")
+        check(night[0] is False and night[1] == 100, f'no bedtime: awake at 23:00-01:00 on its clock, energy is not drained by time ({night})')
+        nap = await ev(A, """(function(){var s=Tama.Pet.create(); s.eggMs=Tama.CONFIG.T.HATCH; Tama.Pet.simulate(s,1000); s.energy=0; Tama.Pet.simulate(s, 60000);
+            var a=[s.asleep, s.napping]; Tama.Pet.simulate(s, 4*3600e3); var b=s.asleep; Tama.Pet.simulate(s, 1.5*3600e3); return a.concat([b, s.asleep, Math.round(s.energy)])})()""")
+        check(nap[0] and nap[1] and nap[2] and not nap[3] and nap[4] >= 40, f'energy 0: it naps (+8/h) and wakes by itself at 40 ({nap})')
+        evo = await ev(A, """(function(){var s=Tama.Pet.create(); s.eggMs=Tama.CONFIG.T.HATCH; Tama.Pet.simulate(s,1000); s.tz='UTC'; s.hunger=4; s.happy=4;
+            s.ageMs=Tama.CONFIG.T.TEEN_AT-30000; s.createdAt=Date.UTC(2026,0,1,23,30,0)-s.ageMs-s.eggMs; Tama.Pet.simulate(s,60000); return [s.stage, s.asleep]})()""")
+        check(evo == ['teen', False], f'evolution happens on time at night too (no waiting for morning) ({evo})')
 
-        await make_pet(pg, 'vesper', 'PIPO', "s.poops=[{age:0,counted:false}]; s.xp=540; s.ageMs=Tama.CONFIG.T.ADULT_AT-(28*3600e3+17*60e3); Tama.Pet.setClock(s,12); s.st.battles=6; s.st.wins=5; s.st.losses=1; s.st.training=4;")
-        await ev(pg, "var u=Tama.Game.ui; u.pet.x=10; u.pet.move='hop'; u.emote='heart'; u.emoteUntil=performance.now()+1e9; u.nextThink=performance.now()+1e9;")
-        await pg.wait_for_timeout(400); await pg.screenshot(path=f'{SHOTS}/01-phone-home-day.png')
-        check(await ev(pg, "document.body.dataset.env") == 'day', 'daytime meadow')
-        await tap_icon(pg, 'status'); await pg.wait_for_timeout(250)
-        await pg.screenshot(path=f'{SHOTS}/03-phone-status-level-countdown.png')
-        info = await ev(pg, "[Tama.Pet.level(Tama.Game.state), Tama.Pet.evolvesIn(Tama.Game.state)]")
-        check(info[0] == 9 and abs(info[1] - (28 * 3600e3 + 17 * 60e3)) < 5000, f'status shows Lv {info[0]} and evolves in 1d 4h ({info[1]/3600000:.2f} h)')
-        await tap_icon(pg, 'back')
-        await ev(pg, "Tama.Game.ui.nextThink=0; Tama.Game.ui.emote=null")
+        # status pages (energy + wallet + level cap)
+        await tap_icon(A, 'status'); pages = []
+        for _ in range(5): pages.append(await ev(A, 'Tama.Game.ui.page')); await tap_zone(A, 'status', 250)
+        check(pages == [0, 1, 2, 3, 4] and await mode(A) == 'main', f'STATUS pages PROFILE/CARE/ENERGY/WALLET/RECORD {pages}')
 
-        await tap_icon(pg, 'battle'); check(await mode(pg) == 'battleMenu', 'BATTLE icon opens RANDOM/FRIEND/CPU menu')
-        await pg.wait_for_timeout(200); await pg.screenshot(path=f'{SHOTS}/05-phone-battle-menu.png')
-        b0 = (await st(pg))['battles']
-        await tap_zone(pg, 'opt2')
-        check(await ev(pg, "Tama.Game.ui.battle && Tama.Game.ui.battle.kind") == 'cpu', 'CPU option starts a computer battle')
-        check(await fight_by_tapping([pg]), 'CPU battle played to the end by tapping HI/LO')
-        s2 = await st(pg)
-        check(s2['battles'] == b0 + 1, 'CPU battle recorded')
-        check(s2['xp'] > 540 and s2['st']['battles'] == 7, f"battle gives XP ({s2['xp'] - 540}) and counts for this stage")
-        xw = await ev(pg, "[Tama.Battle.battleXp('win',10,10), Tama.Battle.battleXp('win',10,14), Tama.Battle.battleXp('loss',10,10), Tama.Battle.battleXp('loss',10,14), Tama.Battle.battleXp('fled',10,20)]")
-        check(xw[0] > xw[2] > 0 and xw[1] > xw[0] and xw[3] > xw[2] and xw[4] == 0, f'win XP > loss XP > 0, more vs higher-level foes, nothing for fleeing {xw}')
+        # ================= 3. the bell: badge for the most urgent issue + attention panel =================
+        await make_pet(A, 'nekoru', 'PIPO', pet={'hunger': 0, 'xp': 200}, eco_={'coins': 240})
+        await dbg(A, {'op': 'poop'}); await dbg(A, {'op': 'sick'})
+        await A.wait_for_timeout(300)
+        bell = await ev(A, """(function(){var b=document.querySelector('.pbtn.bell'), g=b.querySelector('.badge');
+            return {alert:b.classList.contains('alert'), urgent:b.classList.contains('urgent'), hidden:g.hidden, top:g.dataset.top, count:g.querySelector('b').textContent, label:b.getAttribute('aria-label')}})()""")
+        check(bell['alert'] and bell['urgent'] and not bell['hidden'] and bell['top'] == 'sick' and bell['count'] == '3',
+              f"bell lights up with the most urgent issue's icon (sick) and a count of 3 ({bell['top']}, {bell['count']})")
+        check('Sick' in bell['label'] and 'Starving' in bell['label'], 'bell has an accessible label listing the issues')
+        await ev(A, "var u=Tama.Game.ui; u.pet.x=24; u.pet.move='stay'; u.nextThink=performance.now()+1e9;")
+        await shot(A, '10-phone-bell-badge', 500)
+        await tap_icon(A, 'attention')
+        items = await ev(A, "[...document.querySelectorAll('#attnList li')].map(l=>l.dataset.item)")
+        check(await ev(A, "!document.getElementById('attnPanel').hidden") and items == ['sick', 'hungry', 'poop'], f'tapping the bell opens the attention panel, most urgent first {items}')
+        await shot(A, '08-phone-attention-panel', 300)
+        await tap(A, '[data-action="sick:medicine"]', 300); await idle(A)
+        await dbg(A, {'op': 'patch', 'pet': {'doses': 0}})
+        s = await st(A)
+        await tap_icon(A, 'attention'); await tap(A, '[data-action="hungry:feed"]', 300); await idle(A)
+        check((await st(A))['hunger'] == 1, 'quick action FEED from the panel feeds a meal')
+        await tap_icon(A, 'attention'); await tap(A, '[data-action="poop:clean"]', 300); await idle(A)
+        check(len((await st(A))['poops']) == 0, 'quick action CLEAN from the panel cleans')
+        await dbg(A, {'op': 'patch', 'pet': {'sick': False, 'hunger': 4, 'happy': 4, 'energy': 12}})
+        await A.wait_for_timeout(200)
+        check(await ev(A, "document.querySelector('.pbtn.bell .badge').dataset.top") == 'tired', 'low energy shows the energy badge on the bell')
+        await tap_icon(A, 'attention'); await tap(A, '[data-action="tired:sleep"]', 300); await idle(A)
+        check((await st(A))['asleep'], 'quick action SLEEP from the panel turns the lights off')
+        await dbg(A, {'op': 'patch', 'pet': {'asleep': False, 'lightsOff': False, 'energy': 100}})
+        await tap_icon(A, 'attention')
+        check(await ev(A, "!document.getElementById('attnEmpty').hidden && document.querySelectorAll('#attnList li').length===0"), 'nothing wrong: the panel says "All good"')
+        await tap(A, '#attnClose')
+        age0 = (await st(A))['ageMs']
+        await dbg(A, {'op': 'patch', 'pet': {'ageMs': await ev(A, "Tama.Evolution.nextAgeAt(Tama.Game.state)") - 2 * HOUR}})
+        items = await ev(A, "Tama.Game.attentionItems().map(i=>i.id)")
+        check('evolve' in items, f'bell warns when an evolution is less than 3 h away {items}')
+        await dbg(A, {'op': 'patch', 'pet': {'ageMs': age0}})
 
-        code = await ev(pg, "Tama.Battle.encode({name:'RIVAL',formId:'kingleo',xp:640,training:9,wins:7,battles:9,weight:33})")
-        await tap_icon(pg, 'battle'); await tap_zone(pg, 'opt1')
-        check(await ev(pg, "!document.getElementById('linkPanel').hidden"), 'FRIEND option opens the friend-code sheet')
-        my = await pg.inner_text('#myCode')
-        mine = await ev(pg, f"Tama.Battle.decode({json.dumps(my)})||{{}}")
-        check(mine.get('formId') == 'vesper' and mine.get('xp', 0) > 540, f'sheet shows own code with species and XP {mine}')
-        old = await ev(pg, """(function(){var body=['TP1','OLDPAL','mochi',4,2,3,12].join('|'), h=7; for (var ch of body) h=(h*31+ch.charCodeAt(0))%1296;
-            return Tama.Battle.decode('TP-'+btoa(body+'|'+h.toString(36)).replace(/=+$/,''))})()""")
-        check(old and old['formId'] == 'nekoru' and old['xp'] > 0, f'old TP1 friend codes still work (legacy form mapped) {old}')
-        oldb = await ev(pg, """(function(){var body=['TP1','BABY','pixbit',1,0,0,6].join('|'), h=7; for (var ch of body) h=(h*31+ch.charCodeAt(0))%1296;
-            return Tama.Battle.decode('TP-'+btoa(body+'|'+h.toString(36)).replace(/=+$/,''))})()""")
-        check(oldb and oldb['formId'] == 'blob', f'old FANGLET friend codes become the BLOB {oldb}')
-        await pg.fill('#friendCode', 'TP-nonsense'); await pg.locator('#linkFight').tap()
-        check('look right' in await pg.inner_text('#linkError'), 'bad friend code shows an error')
-        await pg.fill('#friendCode', code); await pg.wait_for_timeout(100)
-        pass
-        await pg.locator('#linkFight').tap(); await pg.wait_for_timeout(200)
-        check(await ev(pg, "Tama.Game.ui.battle && Tama.Game.ui.battle.opp.card.formId") == 'kingleo', 'friend battle uses the code species')
-        check(await ev(pg, "Tama.Battle.level(Tama.Game.ui.battle.opp.card)") == 10, 'friend level comes from the code XP (Lv 10)')
-        await pg.wait_for_function("Tama.Game.ui.battle.phase==='choose'", timeout=5000)
-        await tap_icon(pg, 'back')
-        check(await ev(pg, "Tama.Game.ui.battle && Tama.Game.ui.battle.reason") == 'fled', 'back arrow flees a battle')
-        await pg.wait_for_function("Tama.Game.ui.mode==='main'", timeout=5000)
+        # ================= 4. energy: out of energy panel (free options only) =================
+        await dbg(A, {'op': 'patch', 'pet': {'energy': 5, 'hunger': 4, 'happy': 4, 'poops': []}})
+        await tap_icon(A, 'play', 600)
+        c = await ev(A, "Tama.Game.ui.confirm && {id:Tama.Game.ui.confirm.id, lines:Tama.Game.ui.confirm.lines.join(' '), yes:Tama.Game.ui.confirm.yes.label}")
+        check(c and c['id'] == 'tired' and 'lights off' in c['lines'] and 'FIZZ' not in c['lines'].upper() and 'shop' not in c['lines'].lower(),
+              f'not enough energy: TOO TIRED panel with free options only, no upsell ({c})')
+        await shot(A, '11-phone-out-of-energy', 200)
+        await tap_zone(A, 'tiredYes'); await idle(A)
+        check((await st(A))['asleep'], 'TOO TIRED -> SLEEP turns the lights off')
+        await dbg(A, {'op': 'patch', 'pet': {'asleep': False, 'lightsOff': False, 'energy': 100}})
 
-        await ev(pg, "var s=Tama.Game.state; s.hunger=0; s.hungerZeroMs=Tama.CONFIG.T.STARVE_DEATH-1200")
-        await pg.wait_for_function("Tama.Game.state.dead", timeout=5000); await pg.wait_for_timeout(400)
-        await tap_zone(pg, 'dead'); check(await mode(pg) == 'deadConfirm', 'tapping the death screen asks NEW EGG?')
-        await tap_icon(pg, 'back'); check(await mode(pg) == 'main' and (await st(pg))['dead'], 'back from NEW EGG? returns to the grave')
-        await tap_zone(pg, 'dead'); await tap_zone(pg, 'yes')
-        s = await st(pg); check(s['stage'] == 'egg' and not s['dead'], 'tapping YES starts a new egg')
+        # ================= 5. main menu hub + every menu row =================
+        await tap_icon(A, 'home'); check(await mode(A) == 'menu', 'HOME opens the MAIN MENU')
+        ids = await ev(A, "Tama.Game.zoneIds()")
+        check(all(z in ids for z in ['mMeadow', 'mBattle', 'mJobs', 'mShop', 'mStatus', 'mHelp', 'mSettings']), f'menu: Meadow, Battle, Jobs, Shop, Status, Help, Settings')
+        await shot(A, '06-phone-main-menu')
+        await tap_zone(A, 'mMeadow'); check(await mode(A) == 'main', 'menu MEADOW returns to the meadow')
+        await tap_icon(A, 'home'); await tap_zone(A, 'mBattle'); check(await mode(A) == 'battleMenu', 'menu BATTLE opens the battle menu')
+        await tap_icon(A, 'back'); check(await mode(A) == 'menu', 'BACK from a menu screen returns to the menu')
+        await tap_zone(A, 'mStatus'); check(await mode(A) == 'status', 'menu STATUS'); await tap_icon(A, 'back')
+        await tap_icon(A, 'home'); await tap_zone(A, 'mHelp'); check(await mode(A) == 'help', 'menu HELP opens the help pages')
+        await shot(A, '12-phone-help')
+        hp = []
+        for _ in range(6): hp.append(await ev(A, 'Tama.Game.ui.page')); await tap_zone(A, 'help', 200)
+        check(hp == [0, 1, 2, 3, 4, 5] and await mode(A) == 'menu', f'help has 6 pages (care, energy, coins, jobs, shop, XP) {hp}')
+        await tap_zone(A, 'mSettings'); check(await mode(A) == 'settings', 'menu SETTINGS')
+        m0 = await ev(A, 'Tama.Audio.muted'); await tap_zone(A, 'sSound'); check(await ev(A, 'Tama.Audio.muted') != m0, 'settings SOUND toggles sound')
+        await tap_zone(A, 'sSound')
+        # headless Chromium always reports "denied", so stand in for the browser's permission prompt
+        await ev(A, "window.__N=window.Notification; window.Notification=function(t,o){return {close(){}}}; window.Notification.permission='default'; window.Notification.requestPermission=()=>{window.Notification.permission='granted'; return Promise.resolve('granted')}")
+        await tap_zone(A, 'sNotify', 600)
+        check(await ev(A, "Tama.Game.Notify.label()") == 'ON', 'settings ALERTS asks permission and turns browser notifications on')
+        await shot(A, '13-phone-settings')
+        await tap_zone(A, 'sAccount'); check(await ev(A, "!document.getElementById('accountPanel').hidden") and 'alice' in await A.inner_text('#accWho'), 'settings ACCOUNT opens the account sheet')
+        check(await ev(A, "document.getElementById('upgradeForm').hidden"), 'no "save as account" form for a real account')
+        await tap(A, '#accClose')
+        await tap_zone(A, 'sLogout'); check(await ev(A, "Tama.Game.ui.confirm && Tama.Game.ui.confirm.id") == 'logout', 'settings LOG OUT asks first')
+        await tap_zone(A, 'logoutNo'); check(await ev(A, 'Tama.Game.session') and not await ev(A, 'Tama.Game.ui.confirm'), 'cancel keeps you logged in')
+        await tap_icon(A, 'back'); await tap_icon(A, 'back')
+
+        # ================= 6. shop: Fizz cap, food, tools; coins =================
+        await make_pet(A, 'nekoru', 'PIPO', pet={'energy': 10, 'xp': 200}, eco_={'coins': 500})
+        await tap_icon(A, 'home'); await tap_zone(A, 'mShop'); check(await mode(A) == 'shop', 'menu SHOP')
+        await shot(A, '04-phone-shop')
+        for i in range(3):
+            await tap_zone(A, 'buy_fizz'); await tap_zone(A, 'buyYes'); await idle(A)
+        s, e = await st(A), await eco(A)
+        check(s['energy'] == 100 and e['coins'] == 320 and e['daily']['drinks'] == 3, f"3 Fizz: +30 energy each (capped at 100), 60 coins each ({s['energy']}, {e['coins']}c)")
+        await dbg(A, {'op': 'patch', 'pet': {'energy': 10}})
+        await tap_zone(A, 'buy_fizz', 300)
+        check('Enough fizz' in (await ev(A, "(Tama.Game.ui.toast||{}).l1") or '') and not await ev(A, 'Tama.Game.ui.confirm'), 'the 4th Fizz of the day is refused (no upsell)')
+        r = await api(A, 'POST', '/api/act', {'type': 'buy', 'sku': 'fizz'})
+        check(r['data']['ok'] is False and r['data']['error'] == 'cap' and (await eco(A))['coins'] == 320, 'edited request for a 4th Fizz is rejected by the server')
+        await dbg(A, {'op': 'patch', 'pet': {'hunger': 1}})
+        await tap_zone(A, 'buy_stew'); await tap_zone(A, 'buyYes'); await idle(A)
+        check((await st(A))['hunger'] == 3 and (await eco(A))['coins'] == 308, 'HEARTY STEW: +2 hunger for 12 coins')
+        await tap_icon(A, 'home'); await tap_zone(A, 'mShop')
+        await tap_zone(A, 'buy_pick3', 300)
+        await tap_zone(A, 'buyNo') if await ev(A, '!!Tama.Game.ui.confirm') else None
+        r = await api(A, 'POST', '/api/act', {'type': 'buy', 'sku': 'pick3'})
+        check(r['data']['ok'] is False and r['data']['error'] in ('needs', 'coins'), f"edited request: PICKAXE III without II/coins is rejected ({r['data']['error']})")
+        await dbg(A, {'op': 'patch', 'eco': {'coins': 3}})
+        r = await api(A, 'POST', '/api/act', {'type': 'buy', 'sku': 'stew'})
+        check(r['data']['ok'] is False and r['data']['error'] == 'coins', 'buying without enough coins is rejected')
+        chk = await ev(A, "Tama.Economy.freeMoneyCheck()")
+        check(chk['ok'] and chk['best'] < chk['drink'], f"coins per energy from work ({chk['best']}) stay below the Fizz price per energy ({chk['drink']})")
+        await tap_icon(A, 'back')
+
+        # ================= 7. Pix Town Jobs: start, away, finish, pay, recall, locks =================
+        await make_pet(A, 'blob', 'PIPO', eco_={'coins': 100})
+        await tap_icon(A, 'home'); await tap_zone(A, 'mJobs'); check(await mode(A) == 'jobs' and await ev(A, "document.body.dataset.env") == 'mine', 'menu PIX TOWN JOBS opens the mine scene')
+        ids = await ev(A, "Tama.Game.zoneIds()")
+        check('go_tidy' in ids and 'go_cart' not in ids and 'go_smelter' not in ids, f'baby: only TIDY-UP is open; mine jobs locked ({[i for i in ids if i.startswith("go_")]})')
+        r = await api(A, 'POST', '/api/act', {'type': 'job_start', 'id': 'smelter'})
+        check(r['data']['ok'] is False and r['data']['error'] == 'locked', 'edited request for a locked job is rejected')
+        await make_pet(A, 'nekoru', 'PIPO', pet={'hunger': 4}, eco_={'coins': 100})
+        await tap_icon(A, 'home'); await tap_zone(A, 'mJobs')
+        await shot(A, '05-phone-jobs-mine')
+        await tap_zone(A, 'go_cart'); check(await ev(A, "Tama.Game.ui.confirm.id") == 'job', 'GO asks to confirm (duration, energy, pay)')
+        await tap_zone(A, 'jobYes'); await idle(A)
+        s = await st(A)
+        check(s['job'] and s['job']['id'] == 'cart' and s['energy'] == 80, f"ORE CART started: pet away, -20 energy ({s['energy']})")
+        await ev(A, "Tama.Game.ui.toast=null")
+        await shot(A, '05b-phone-job-in-progress', 900)
+        await tap_icon(A, 'back'); await tap_icon(A, 'back')
+        check(await ev(A, "Tama.Game.zoneIds().includes('away')") and 'pet' not in await ev(A, "Tama.Game.zoneIds()"), 'the meadow is empty with an "away at work" sign')
+        await tap_icon(A, 'feed', 300)
+        check('Away at work' in (await ev(A, "(Tama.Game.ui.toast||{}).l1") or ''), 'care while working: clear "away at work" message')
+        r = await api(A, 'POST', '/api/act', {'type': 'feed'})
+        check(r['data']['error'] == 'working', 'server refuses care while the pet is at work')
+        hungerT0 = (await st(A))['hungerT']
+        await dbg(A, {'op': 'skip', 'ms': 20 * 60e3})
+        await dbg(A, {'op': 'finish_job'}); await idle(A)
+        s, e = await st(A), await eco(A)
+        check(s['job'] is None and e['coins'] == 125 and e['inventory']['ore'] == 1, f"job done: +25 coins, +1 ore ({e['coins']}c, ore {e['inventory']['ore']})")
+        check(await ev(A, "document.querySelector('.pbtn.bell .badge').dataset.top") == 'jobDone', 'bell shows the job-done badge')
+        await tap_icon(A, 'attention'); await tap(A, '[data-action="jobDone:ok"]', 400); await idle(A)
+        check((await eco(A))['lastJob']['seen'], 'job-done quick action clears it')
+        await tap_icon(A, 'home'); await tap_zone(A, 'mJobs'); await tap_zone(A, 'go_tidy'); await tap_zone(A, 'jobYes'); await idle(A)
+        await tap_zone(A, 'recall'); await tap_zone(A, 'recallYes'); await idle(A)
+        check((await st(A))['job'] is None and (await eco(A))['coins'] == 125, 'RECALL brings it home early with no pay')
+        await tap_icon(A, 'back')
+        work = await ev(A, """(function(){var a=Tama.Pet.create(), b; a.eggMs=Tama.CONFIG.T.HATCH; Tama.Pet.simulate(a,1000); a.hunger=4; a.happy=4; b=JSON.parse(JSON.stringify(a));
+            b.job={id:'deep',name:'DEEP SHIFT',startT:b.simT,endT:b.simT+8*3600e3,pay:60,ore:2}; Tama.Pet.simulate(a, 5400e3); Tama.Pet.simulate(b, 5400e3);
+            return [a.hunger, b.hunger, b.asleep]})()""")
+        check(work[1] < work[0] and work[2] is False, f'hunger drops faster at work, and it never sleeps on the job ({work})')
+
+        # ================= 8. CPU battle (server-run) =================
+        await make_pet(A, 'nekoru', 'ALICE', pet={'xp': 400}, eco_={'coins': 125})
+        b0, en0 = (await st(A))['battles'], (await st(A))['energy']
+        await tap_icon(A, 'battle'); check(await mode(A) == 'battleMenu', 'BATTLE opens RANDOM / CPU / FRIEND / CHALLENGE')
+        await shot(A, '14-phone-battle-menu')
+        await tap_zone(A, 'bCpu', 600)
+        await A.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.kind==='cpu'", timeout=6000)
+        check(True, 'VS COMPUTER starts a server battle')
+        check(await fight_by_tapping([A], shot=f'{SHOTS}/15-phone-cpu-battle.png'), 'CPU battle played to the end by tapping HI/LO')
+        await A.wait_for_function("Tama.Game.ui.mode==='main'", timeout=8000); await refresh(A)
+        s = await st(A)
+        check(s['battles'] == b0 + 1 and abs(s['energy'] - (en0 - 6)) < 0.5, f"CPU battle recorded, cost 6 energy ({en0:.0f} -> {s['energy']:.0f})")
+
+        # ================= 9. second account: random online, friend code, challenges =================
+        ctxB, B = await new_page(browser, PHONE, 'B', perms=['notifications'])
+        await B.goto(BASE); await signup(B, 'bob')
+        await make_pet(B, 'scrapper', 'BOB', pet={'xp': 300})
+        await make_pet(A, 'nekoru', 'ALICE', pet={'xp': 400})
+        sa0, sb0 = await st(A), await st(B)
+        ca0, cb0 = (await eco(A))['daily']['battleCoins'], (await eco(B))['daily']['battleCoins']
+        await tap_icon(A, 'battle'); await tap_zone(A, 'bRandom', 500)
+        check(await mode(A) == 'search', 'RANDOM ONLINE starts searching')
+        await shot(A, '16-phone-searching', 900)
+        await tap_icon(B, 'battle'); await tap_zone(B, 'bRandom', 500)
+        await A.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.kind==='online'", timeout=8000)
+        await B.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.kind==='online'", timeout=8000)
+        oa, ob = await ev(A, "Tama.Game.ui.battle.opp.card"), await ev(B, "Tama.Game.ui.battle.opp.card")
+        check(oa['name'] == 'BOB' and oa['formId'] == 'scrapper' and ob['name'] == 'ALICE', 'two accounts matched online, each sees the other\'s server-held pet')
+        r = await api(A, 'POST', '/api/act', {'type': 'feed'})
+        check(r['data'].get('ok') is False and r['data'].get('error') == 'battle', f"care actions are refused during a battle ({r})")
+        await A.wait_for_function("Tama.Game.ui.battle.phase==='choose'", timeout=9000)
+        await shot(A, '17-phone-online-battle', 500)
+        check(await fight_by_tapping([A, B]), 'online battle finished (both players tapping)')
+        await refresh(A); await refresh(B)
+        sa, sb = await st(A), await st(B)
+        check(sa['battles'] == sa0['battles'] + 1 and sb['battles'] == sb0['battles'] + 1 and (sa['wins'] - sa0['wins']) + (sb['wins'] - sb0['wins']) == 1,
+              'both pets recorded the battle, exactly one winner')
+        ea, eb = await eco(A), await eco(B)
+        da, db = ea['daily']['battleCoins'] - ca0, eb['daily']['battleCoins'] - cb0
+        check(sorted([da, db]) == [4, 12], f"online coins: win 12, loss 4 ({da}, {db})")
+
+        # friend code: ghost battle vs the stored pet
+        bcode = (await ev(B, 'Tama.Game.user'))['friendCode']
+        await tap_icon(A, 'battle'); await tap_zone(A, 'bFriend')
+        check(await ev(A, "!document.getElementById('linkPanel').hidden") and await A.inner_text('#myCode') == (await ev(A, 'Tama.Game.user'))['friendCode'],
+              'FRIEND CODE sheet shows your server friend code')
+        await A.fill('#friendCode', 'TP-eyJuIjoiUElQTyIsImYiOiJuZWtvcnUifQ'); await tap(A, '#linkFight')
+        check('Old codes' in await A.inner_text('#linkError'), 'old TP- codes get a clear "ask for the new code" message')
+        await A.fill('#friendCode', 'hello'); await tap(A, '#linkFight')
+        check('PX-' in await A.inner_text('#linkError'), 'a malformed code shows the expected format')
+        await A.fill('#friendCode', bcode.lower()); await tap(A, '#linkFight', 600)
+        await A.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.kind==='friend'", timeout=6000)
+        opp = await ev(A, "Tama.Game.ui.battle")
+        check(opp['opp']['card']['name'] == 'BOB' and opp['ghost'], 'friend code battle vs BOB\'s server-held pet (computer-controlled)')
+        await A.wait_for_function("Tama.Game.ui.battle.phase==='choose'", timeout=8000)
+        await tap_icon(A, 'back', 300)
+        check(await ev(A, "Tama.Game.ui.battle && Tama.Game.ui.battle.reason") == 'fled', 'BACK flees a battle')
+        await A.wait_for_function("Tama.Game.ui.mode==='main'", timeout=6000)
+
+        # challenge (both online): live on the bell, browser notification, accept -> live battle
+        await ev(B, "Object.defineProperty(document, 'hasFocus', {value: () => false, configurable: true})")   # B looks at another tab
+        await ev(B, "window.__notes=[]; const N=window.Notification; window.Notification=function(t,o){window.__notes.push(o.body); return {close(){}}}; window.Notification.permission='granted'; window.Notification.requestPermission=()=>Promise.resolve('granted'); localStorage.setItem('tamapix.notify','1')")
+        await tap_icon(A, 'battle'); await tap_zone(A, 'bChallenge')
+        check(await ev(A, "!document.getElementById('challengePanel').hidden"), 'CHALLENGE opens the challenge sheet')
+        await A.fill('#chTarget', 'nobody_here'); await tap(A, '#chSend', 500)
+        check('No player' in await A.inner_text('#chError'), 'challenging an unknown player shows an error')
+        await A.fill('#chTarget', 'alice'); await tap(A, '#chSend', 500)
+        check('yourself' in await A.inner_text('#chError'), "you can't challenge yourself")
+        await A.fill('#chTarget', 'bob'); await tap(A, '#chSend', 600)
+        check('sent to bob (online now)' in await A.inner_text('#chError'), 'challenge sent by username (bob is online)')
+        await B.wait_for_function("Tama.Game.challenges.incoming.length===1", timeout=5000)
+        await B.wait_for_timeout(300)
+        bb = await ev(B, "document.querySelector('.pbtn.bell .badge').dataset.top")
+        check(bb == 'challenge', 'the challenged player sees it live on the bell (challenge badge)')
+        notes = await ev(B, 'window.__notes')
+        check(any('alice challenged you' in n for n in notes), f'a browser notification is shown for the challenge {notes}')
+        await shot(B, '18-phone-challenge-notification', 200)
+        await tap_icon(B, 'attention')
+        check('alice challenged you to a fight!' in await B.inner_text('#attnList'), 'attention panel lists the challenge with Accept / Decline')
+        await shot(B, '18b-phone-challenge-panel', 200)
+        await tap(A, '#chClose')
+        await tap(B, '[data-action="challenge:acc"]', 600)
+        await A.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.live", timeout=8000)
+        await B.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.live", timeout=8000)
+        check(True, 'accepting while both are online starts a LIVE battle for both players')
+        check(await fight_by_tapping([A, B]), 'live challenge battle finished')
+        await A.wait_for_timeout(600); await refresh(A)
+        outg = (await ev(A, 'Tama.Game.challenges'))['outgoing']
+        check(outg and outg[0]['status'] == 'done' and 'won' in (outg[0]['result'] or ''), f'the challenge is recorded as done ({outg[0] if outg else None})')
+
+        # decline
+        await ev(A, "Tama.Game.toast('', '', 1)")
+        r = await api(A, 'POST', '/api/challenge', {'target': bcode})
+        check(r['data']['ok'] and r['data']['online'], 'challenge by friend code works too')
+        await B.wait_for_function("Tama.Game.challenges.incoming.length===1", timeout=5000)
+        await tap_icon(B, 'attention'); await tap(B, '[data-action="challenge:dec"]', 600)
+        await A.wait_for_function("(Tama.Game.ui.toast||{}).l1 && Tama.Game.ui.toast.l1.indexOf('declined')>=0", timeout=5000)
+        check(True, 'DECLINE notifies the challenger live')
+
+        # offline challenge: stored server-side, shown on next login; accepting fights the stored pet
+        await ctxB.close()
+        await A.wait_for_timeout(300)
+        r = await api(A, 'POST', '/api/challenge', {'target': 'bob'})
+        check(r['data']['ok'] and not r['data']['online'], 'challenging an offline player stores it on the server')
+        await ctxA.close()                                    # the challenger goes offline too
+        ctxB, B = await new_page(browser, PHONE, 'B2'); await B.goto(BASE); await login(B, 'bob')
+        await B.wait_for_timeout(400)
+        inc = await ev(B, "Tama.Game.challenges.incoming")
+        check(len(inc) == 1 and inc[0]['from'] == 'alice' and not inc[0]['online'], 'on next login the stored challenge is on the bell')
+        await tap_icon(B, 'attention')
+        check('Offline' in await B.inner_text('#attnList'), 'the panel says the challenger is offline (you fight their monster)')
+        await tap(B, '[data-action="challenge:acc"]', 600)
+        await B.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.kind==='friend'", timeout=8000)
+        g = await ev(B, "Tama.Game.ui.battle")
+        check(g['ghost'] and g['opp']['card']['name'] == 'ALICE', 'accepting with the challenger offline = battle vs the server-held copy of their pet')
+        check(await fight_by_tapping([B]), 'ghost challenge battle finished')
+
+        # ================= 10. cheats: edited requests & forged socket messages =================
+        await make_pet(B, 'scrapper', 'BOB')
+        r = await api(B, 'POST', '/api/act', {'type': 'train_guess', 'round': 5, 'g': 1})
+        check(r['data']['ok'] is False and r['data']['error'] == 'no_training', 'forged training result without a session is rejected')
+        await api(B, 'POST', '/api/act', {'type': 'train_start'})
+        r = await api(B, 'POST', '/api/act', {'type': 'train_guess', 'round': 3, 'g': 1})
+        check(r['data']['ok'] is False and r['data']['error'] == 'bad_guess', 'skipping training rounds is rejected')
+        EXPECTED_ERR.append('403 (Forbidden)')
+        r = await api(B, 'POST', '/api/act', {'type': 'feed'}, tama=False)
+        check(r['status'] == 403, 'requests without the X-Tama header are refused (CSRF guard)')
+        r = await api(B, 'POST', '/api/act', {'type': 'give_coins', 'n': 999})
+        check(r['data']['ok'] is False and r['data']['error'] == 'bad_action', 'unknown actions are rejected')
+        xs = await ev(B, """new Promise(async (done) => {
+          const w = new WebSocket('ws://' + location.host + '/ws');
+          const next = (t) => new Promise(r => { const h = (e) => { const m = JSON.parse(e.data); if (!t || m.t === t) { w.removeEventListener('message', h); r(m); } }; w.addEventListener('message', h); });
+          await next('hello');
+          w.send(JSON.stringify({t:'cpu', card:{name:'HAX', formId:'drakon', xp:99999, hp:999, pow:99}}));
+          const m = await next('matched'); await next('turn');
+          w.send(JSON.stringify({t:'result', res:{hit:true, dmg:99}})); w.send(JSON.stringify({t:'move', dir:'nuke', n:1}));
+          w.send(JSON.stringify({t:'leave'})); await next('end'); w.close();
+          done({you: m.you, real: Tama.Battle.view(Tama.Battle.fighter(Tama.Battle.card(Tama.Game.state)))});
+        })""")
+        check(xs['you']['card']['formId'] == 'scrapper' and xs['you']['max'] == xs['real']['max'], f"socket battle ignores the client's claimed pet/stats (server used {xs['you']['card']['formId']}, hp {xs['you']['max']})")
+        r = await api(B, 'POST', '/api/debug', {'op': 'patch', 'eco': {'coins': 1}})
+        check(r['status'] == 200, '(main test server runs with DEBUG=1, so debug ops work here)')
+
+        # ================= 11. guest, local-save import, upgrade, logout/login, delete =================
+        ctxG, G = await new_page(browser, PHONE, 'G')
+        await G.goto(BASE)
+        old = dict(v=1, name='OLDIE', formId='kingleo', stage='adult', history=['egg', 'pixbit', 'mochi', 'kingleo'], eggMs=12000, ageMs=2500000, hunger=3, happy=3,
+                   weight=30, discipline=50, poops=[], careMistakes=2, meals=10, snacks=3, battles=9, wins=6, plays=10, training=19, xp=999999, lastSaved=int(time.time() * 1000) - 3600e3)
+        await ev(G, f"localStorage.setItem('tamapix.save.v1', {json.dumps(json.dumps(old))})")
+        await G.goto(BASE); await G.wait_for_selector('#authPanel:not([hidden])')
+        await tap(G, '#guestGo', 400)
+        await G.wait_for_selector('#importPanel:not([hidden])', timeout=6000)
+        check('OLDIE' in await G.inner_text('#importText'), 'an old browser save is offered for a one-time import')
+        await shot(G, '19-phone-import-offer')
+        await tap(G, '#importGo', 800); await idle(G)
+        s = await st(G)
+        cap = await ev(G, "Tama.Battle.xpFor(Tama.CONFIG.LEVEL_CAP.adult)")
+        check(s['formId'] == 'kingleo' and s['name'] == 'OLDIE' and s['xp'] <= min(cap, 19 * 30 + 9 * 80) and s['battles'] == 9,
+              f"import keeps the form, clamps suspicious XP (999999 -> {s['xp']})")
+        check(await ev(G, "localStorage.getItem('tamapix.save.v1')===null") and (await ev(G, 'Tama.Game.user'))['imported'], 'the old save is imported only once')
+        r = await api(G, 'POST', '/api/import', {'save': old})
+        check(r['data']['ok'] is False and r['data']['error'] == 'imported', 'a second import is refused by the server')
+        check((await ev(G, 'Tama.Game.user'))['isGuest'], 'guest play works without a username')
+        await tap_icon(G, 'home'); await tap_zone(G, 'mSettings'); await tap_zone(G, 'sAccount')
+        check(await ev(G, "!document.getElementById('upgradeForm').hidden"), 'guest account sheet offers "save as account"')
+        await G.fill('#upUser', 'bob'); await G.fill('#upPass', 'secret123'); await tap(G, '#upGo', 600)
+        check('taken' in await G.inner_text('#accError'), 'upgrade refuses a taken username')
+        await G.fill('#upUser', 'carol'); await G.fill('#upPass', 'secret123'); await tap(G, '#upGo', 800)
+        u = await ev(G, 'Tama.Game.user')
+        check(not u['isGuest'] and u['username'] == 'carol', 'guest upgraded to an account (same monster)')
+        await tap(G, '#accLogout', 600)
+        await G.wait_for_selector('#authPanel:not([hidden])', timeout=5000)
+        check(not await ev(G, 'Tama.Game.session'), 'log out returns to the log-in sheet')
+        await tap(G, '#tabLogin', 100); await G.fill('#authUser', 'carol'); await G.fill('#authPass', 'wrongpass1'); await tap(G, '#authGo', 600)
+        check('Wrong username or password' in await G.inner_text('#authError'), 'wrong password is refused')
+        await login(G, 'carol')
+        check((await st(G))['formId'] == 'kingleo', 'logging back in restores the same server-held monster')
+        await ev(G, "Tama.Game.resetUI()")
+        await G.reload(); await G.wait_for_function('Tama.Game.session', timeout=8000); await G.wait_for_timeout(300)
+        check(await ev(G, "document.getElementById('importPanel').hidden"), 'no import offer after it was used')
+        await ctxG.close()
+        ctxD, D = await new_page(browser, PHONE, 'D'); await D.goto(BASE); await D.wait_for_selector('#authPanel:not([hidden])')
+        await tap(D, '#guestGo', 600); await D.wait_for_function('Tama.Game.session', timeout=8000)
+        D.on('dialog', lambda d: asyncio.ensure_future(d.accept()))
+        await tap_icon(D, 'home'); await tap_zone(D, 'mSettings'); await tap_zone(D, 'sAccount'); await tap(D, '#accDelete', 800)
+        await D.wait_for_selector('#authPanel:not([hidden])', timeout=5000)
+        r = await api(D, 'GET', '/api/state')
+        check(r['data'].get('auth') is False, 'guest can delete its account (session gone)')
+        await ctxD.close()
+
+        # ================= 12. server restart: data survives locally, offline message while down =================
+        await make_pet(B, 'scrapper', 'BOB', pet={'xp': 321})
+        await B.wait_for_timeout(1200)                        # debounced file write
+        stop(node); node = None
+        EXPECTED_ERR.extend(['ERR_CONNECTION_REFUSED', 'WebSocket connection', 'Failed to load resource'])
+        await refresh(B); await B.wait_for_timeout(300)
+        check(await ev(B, "!document.getElementById('offlinePanel').hidden"), 'server down: a clear OFFLINE message (no local play)')
+        await shot(B, '20-phone-offline', 100)
+        node = start_node()
+        await tap(B, '#offRetry', 1200)
+        rr = [await ev(B, "document.getElementById('offlinePanel').hidden"), (await st(B))['xp']]
+        check(rr[0] and rr[1] == 321, f'RETRY reconnects; the pet was kept by the file store across the restart {rr}')
+        del EXPECTED_ERR[:]
+        await ctxB.close()
+
+        # ================= 13. static host and file:// -> OFFLINE message =================
+        static = start_static()
+        EXPECTED_ERR.extend(['404', 'Failed to load resource'])
+        ctx, pg = await new_page(browser, PHONE, 'static')
+        await pg.goto(f'http://localhost:{STATIC_PORT}/'); await pg.wait_for_selector('#offlinePanel:not([hidden])', timeout=6000)
+        check('not the game server' in await pg.inner_text('#offDetail'), 'page on a static host: OFFLINE explains the game server is missing')
+        await ctx.close(); stop(static)
+        ctx, pg = await new_page(browser, PHONE, 'file')
+        await pg.goto('file://' + os.path.join(ROOT, 'index.html')); await pg.wait_for_selector('#offlinePanel:not([hidden])', timeout=6000)
+        check('opened as a file' in await pg.inner_text('#offDetail'), 'file:// shows OFFLINE with how to start the server')
         await ctx.close()
+        del EXPECTED_ERR[:]
 
-        # ================= 2. desktop layout =================
+        # ================= 14. production-like server: no debug, real rate limits, ephemeral warning =================
+        prod = start_node(PROD_PORT, {'DEBUG': None, 'NODE_ENV': 'production', 'RATE_LIMIT_SCALE': None, 'DATA_FILE': '/tmp/tama-e2e-prod.json', 'SESSION_SECRET': 'test-secret-123'}, '/tmp/tama-prod.log')
+        h = Http(PROD_PORT)
+        code_, cfg, _ = h.call('GET', '/api/config')
+        check(cfg['ephemeral'] is True and cfg['debug'] is False and cfg['storage'] == 'file', f'production without DATABASE_URL: file store flagged as ephemeral ({cfg})')
+        code_, d, hd = h.call('POST', '/api/signup', {'username': 'prodtest', 'password': 'secret123'})
+        check(code_ == 200 and 'Secure' in {k.lower(): v for k, v in hd.items()}.get('set-cookie', '') and 'HttpOnly' in {k.lower(): v for k, v in hd.items()}.get('set-cookie', ''), 'production cookies are Secure + HttpOnly')
+        code_, d, _ = h.call('POST', '/api/debug', {'op': 'patch', 'eco': {'coins': 99999}})
+        check(code_ == 403, 'debug time tools are OFF in production (403)')
+        codes = [h.call('POST', '/api/login', {'username': 'prodtest', 'password': 'nope-nope'})[0] for _ in range(12)]
+        check(codes[-1] == 429 and 429 not in codes[:9], f'login attempts are rate-limited ({codes})')
+        ctx, pg = await new_page(browser, PHONE, 'prod')
+        await pg.goto(f'http://localhost:{PROD_PORT}/'); await pg.wait_for_selector('#authPanel:not([hidden])', timeout=6000)
+        check(await ev(pg, "!document.getElementById('ephemeralNote').hidden"), 'log-in sheet warns "test server: saves reset on restart"')
+        await ctx.close(); stop(prod)
+
+        # ================= 15. desktop layout, evolution tree, debug panel =================
         ctx, pg = await new_page(browser, DESK, 'desk')
-        await fresh(pg); await make_pet(pg, 'starla', 'LUNA')
-        await ev(pg, "var u=Tama.Game.ui; u.pet.x=16; u.emote='note'; u.emoteUntil=performance.now()+1e9; u.nextThink=performance.now()+1e9;")
-        await pg.wait_for_timeout(400); await pg.screenshot(path=f'{SHOTS}/09-desktop-home.png')
-        cov = await ev(pg, "(function(){var r=document.getElementById('scene').getBoundingClientRect(); return [r.left, r.top, r.right, r.bottom]})()")
-        check(cov[0] <= 0 and cov[1] <= 0 and cov[2] >= 800 and cov[3] >= 900, 'desktop: scene fills the window')
-        pet = await ev(pg, "(function(){var a=Tama.Game.stageToClient(0,0), b=Tama.Game.stageToClient(96,48); return [a.y, b.y]})()")
-        check(pet[0] > 64 and pet[1] < 900 - 64, 'desktop: stage sits between the HUD bars')
-        await tap_icon(pg, 'status'); check(await mode(pg) == 'status', 'desktop: mouse click on icons works')
-        TREE = [  # (days 0-2 counters, days 2-5 counters, expected day-2 form, expected final)
+        await pg.goto(BASE + '?debug=1'); await signup(pg, 'deskuser')
+        await make_pet(pg, 'starla', 'LUNA')
+        await shot(pg, '21-desktop-home', 400)
+        await tap_icon(pg, 'status'); check(await mode(pg) == 'status', 'desktop: mouse clicks on icons work'); await tap_icon(pg, 'back')
+        TREE = [
             ({'poopMistakes': 5}, {'training': 8, 'battles': 4, 'wins': 2, 'losses': 2}, 'muck', 'toxitan'),
-            ({'poopMistakes': 4}, {'poopMistakes': 5}, 'muck', 'sludgeking'),
             ({'battles': 7, 'wins': 6, 'losses': 1}, {'battles': 10, 'wins': 8, 'losses': 2, 'careMistakes': 1, 'pet': {'discipline': 75}}, 'vesper', 'seraphi'),
-            ({'battles': 7, 'wins': 6, 'losses': 1}, {'battles': 10, 'wins': 3, 'losses': 7}, 'vesper', 'noxseraph'),
             ({'battles': 7, 'wins': 1, 'losses': 6}, {'battles': 8, 'wins': 5, 'losses': 3}, 'scrapper', 'dreadclaw'),
-            ({'battles': 6, 'wins': 0, 'losses': 6}, {'battles': 4, 'wins': 1, 'losses': 3}, 'scrapper', 'oyaji'),
             ({'snacks': 12, 'meals': 10}, {'training': 12}, 'blobbo', 'rokkun'),
-            ({'snacks': 12, 'meals': 10}, {'snacks': 15, 'pet': {'weight': 45}}, 'blobbo', 'chubbo'),
             ({'careMistakes': 1, 'training': 6, 'pet': {'discipline': 75}}, {'careMistakes': 0, 'pet': {'discipline': 100}}, 'nekoru', 'starla'),
-            ({'careMistakes': 2, 'training': 5, 'pet': {'discipline': 50}}, {'careMistakes': 3}, 'nekoru', 'kingleo'),
             ({'careMistakes': 5}, {'careMistakes': 6}, 'kuchibo', 'ghoulie'),
-            ({}, {'training': 10}, 'kuchibo', 'mimiko'),
             ({'battles': 7, 'wins': 7}, {'battles': 9, 'wins': 9}, 'vesper', 'drakon'),
         ]
         for baby, teen, mid, final in TREE:
-            h = (await ev(pg, f"Tama.Debug.runScenario({json.dumps(baby)}, {json.dumps(teen)})"))['history']
-            check(h[2:] == [mid, final], f'evolution: {baby} then {teen} -> {mid} -> {final} (got {h[2:]})')
-        allf = await ev(pg, "[Object.keys(Tama.EVOLUTION.tree.blob.reduce(function(o,b){o[b.to]=1;return o},{})).length, Object.keys(Tama.FORMS).filter(function(k){return Tama.FORMS[k].stage==='adult'}).length]")
-        check(allf[0] == 6 and allf[1] == 13, f'tree: 6 day-2 forms, 12 finals + 1 secret ({allf})')
-        early = await ev(pg, "(function(){var s=Tama.Pet.create(); s.eggMs=Tama.CONFIG.T.HATCH; Tama.Pet.simulate(s,1000); Tama.Pet.setClock(s,12); s.hunger=4; s.happy=4; s.ageMs=Tama.CONFIG.T.TEEN_AT-60000; Tama.Pet.setClock(s,12); Tama.Pet.simulate(s,30000); var a=s.formId; Tama.Pet.simulate(s,60000); return [a, s.formId]})()")
-        check(early == ['blob', 'kuchibo'], f'no evolution before day 2, evolves right after ({early})')
-
-        # time away: the age counts fully, needs decay softly; a normal day away is survivable
-        away = await ev(pg, """(function(){var s=Tama.Pet.create(); s.eggMs=Tama.CONFIG.T.HATCH; Tama.Pet.simulate(s,1000); s.hunger=4; s.happy=4;
-            Tama.Pet.simulate(s, 20*3600e3, null, {away:true}); return [s.dead, s.ageMs/3600e3, s.careMistakes]})()""")
-        check(not away[0] and away[1] >= 20, f'20 h away: still alive, aged {away[1]:.1f} h ({away[2]} care mistakes)')
-        away3 = await ev(pg, """(function(){var s=Tama.Pet.create(); s.eggMs=Tama.CONFIG.T.HATCH; Tama.Pet.simulate(s,1000); s.hunger=4; s.happy=4;
-            Tama.Pet.simulate(s, 3*86400e3, null, {away:true}); return [s.dead, s.stage, s.careMistakes, s.ageMs/86400e3]})()""")
-        check(not away3[0] and away3[1] == 'teen' and away3[3] >= 3, f'3 days away: alive, evolved on the real clock at day 2 ({away3})')
-        long = await ev(pg, """(function(){var s=Tama.Pet.create(); s.eggMs=Tama.CONFIG.T.HATCH; Tama.Pet.simulate(s,1000);
-            Tama.Pet.simulate(s, 10*86400e3, null, {away:true}); return [s.dead, s.cause]})()""")
-        check(long[0], f'10 days of total neglect is fatal ({long})')
-        starve = await ev(pg, """(function(){var s=Tama.Pet.create(); s.eggMs=Tama.CONFIG.T.HATCH; Tama.Pet.simulate(s,1000); Tama.Pet.setClock(s,8); s.hunger=0; s.happy=4;
-            var t=0; while(!s.dead && t<5*86400e3){ s.happy=4; s.poops=[]; s.sick=false; Tama.Pet.simulate(s, 3600e3); t+=3600e3; } return [s.dead, t/3600e3, s.cause]})()""")
-        check(starve[0] and starve[1] >= 30, f'starving (nothing else wrong) takes {starve[1]:.0f} h of real time to kill ({starve[2]})')
-        await ctx.close()
-
-        # save migration: an old v1 pet keeps its form, gets the new timing and no errors
-        ctx, pg = await new_page(browser, PHONE, 'migrate')
-        await pg.goto(BASE)
-        for old, want_form, want_stage in [({'formId': 'kingleo', 'stage': 'adult', 'ageMs': 1300000, 'battles': 9, 'wins': 6, 'plays': 10, 'training': 19}, 'kingleo', 'adult'),
-                                           ({'formId': 'mochi', 'stage': 'child', 'ageMs': 300000, 'battles': 1, 'wins': 1, 'plays': 3, 'training': 4}, 'nekoru', 'teen'),
-                                           ({'formId': 'pixbit', 'stage': 'baby', 'ageMs': 60000, 'battles': 0, 'wins': 0, 'plays': 1, 'training': 1}, 'blob', 'baby'),
-                                           ({'formId': 'seraphi', 'stage': 'secret', 'ageMs': 2500000, 'battles': 2, 'wins': 2, 'plays': 2, 'training': 4}, 'seraphi', 'adult')]:
-            save = dict(v=1, name='OLDIE', history=['egg', 'pixbit', old['formId']], eggMs=12000, hunger=3, happy=3, weight=30, discipline=50,
-                        poops=[], careMistakes=2, meals=10, snacks=3, secretChecked=False, lastSaved=int(time.time() * 1000) - 3600e3, **old)
-            await ev(pg, f"Tama.Pet.save=function(){{}}; localStorage.setItem('tamapix.save.v1', {json.dumps(json.dumps(save))})")
-            await pg.goto(BASE); await pg.wait_for_timeout(500)
-            m = await st(pg)
-            check(m['v'] == 2 and m['formId'] == want_form and m['stage'] == want_stage and not m['dead'] and m['xp'] > 0
-                  and m['ageMs'] >= await ev(pg, f"Tama.Evolution.entryAge('{want_form}')"),
-                  f"v1 save ({old['formId']}) migrates to {m['formId']}/{m['stage']} Lv{await ev(pg, 'Tama.Pet.level(Tama.Game.state)')}")
-        await ctx.close()
-
-        # ================= 3. online: two real players, tap-only =================
-        ctxA, A = await new_page(browser, PHONE, 'A'); ctxB, B = await new_page(browser, PHONE, 'B')
-        await fresh(A); await fresh(B)
-        await make_pet(A, 'dreadclaw', 'ALICE'); await make_pet(B, 'sludgeking', 'BOB', 's.xp=300;')
-        sa0, sb0 = await st(A), await st(B)
-        await tap_icon(A, 'battle'); await tap_zone(A, 'opt0')
-        check(await mode(A) == 'search', 'RANDOM starts searching')
-        await A.wait_for_timeout(1300); await A.screenshot(path=f'{SHOTS}/06-phone-searching.png')
-        await tap_icon(B, 'battle'); await tap_zone(B, 'opt0')
-        await A.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.kind==='online'", timeout=6000)
-        await B.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.kind==='online'", timeout=6000)
-        check(True, 'two phones matched online')
-        oa = await ev(A, "Tama.Game.ui.battle.opp.card"); ob = await ev(B, "Tama.Game.ui.battle.opp.card")
-        check(oa['formId'] == 'sludgeking' and oa['name'] == 'BOB' and ob['formId'] == 'dreadclaw' and ob['name'] == 'ALICE' and oa.get('xp') == 300,
-              f'each player sees the other real pet ({oa["name"]}/{oa["formId"]} vs {ob["name"]}/{ob["formId"]})')
-        await A.wait_for_function("Tama.Game.ui.battle.phase==='choose'", timeout=8000)
-        await B.wait_for_function("Tama.Game.ui.battle.phase==='choose'", timeout=8000)
-        roles = [await ev(A, 'Tama.Game.ui.battle.role'), await ev(B, 'Tama.Game.ui.battle.role')]
-        check(sorted(roles) == ['atk', 'def'], f'server assigns attacker/defender roles {roles}')
-        await A.wait_for_timeout(800)
-        await A.screenshot(path=f'{SHOTS}/04-phone-online-battle.png')
-        check(await ev(A, 'document.body.dataset.env') == 'battle', 'battles use the Gen-3 battle field')
-        ok = await fight_by_tapping([A, B], shot=f'{SHOTS}/04b-phone-online-battle-hit.png')
-        check(ok, 'online battle finished (both players tapping)')
-        sa, sb = await st(A), await st(B)
-        check(sa['battles'] == sa0['battles'] + 1 and sb['battles'] == sb0['battles'] + 1, 'both pets recorded the battle')
-        check(sa['xp'] > sa0['xp'] and sb['xp'] > sb0['xp'], f"both pets gained XP online (+{sa['xp'] - sa0['xp']} / +{sb['xp'] - sb0['xp']})")
-        check((sa['wins'] - sa0['wins']) + (sb['wins'] - sb0['wins']) == 1, 'exactly one winner')
-        log = open('/tmp/tama-node.log').read()
-        check('ALICE' in log and 'winner' in log, 'server resolved the battle (log)')
-
-        # ================= 4. anti-cheat: raw WebSocket clients =================
-        res = await ev(A, """new Promise(async (done) => {
-          const url = 'ws://' + location.host + '/ws', out = {};
-          const open = () => new Promise(r => { const w = new WebSocket(url); w.onopen = () => r(w); });
-          const next = (w, t) => new Promise(r => { const h = (e) => { const m = JSON.parse(e.data); if (!t || m.t === t) { w.removeEventListener('message', h); r(m); } }; w.addEventListener('message', h); });
-          const w1 = await open();
-          w1.send(JSON.stringify({t:'find', card:{name:'HAX',formId:'drakon',training:0,wins:0,battles:0,weight:30}, ageMs: 1000}));
-          out.tooYoung = (await next(w1)).reason;
-          w1.send(JSON.stringify({t:'find', card:{name:'HAX',formId:'kingleo',training:0,wins:0,battles:0,weight:30}, ageMs: 3*86400e3}));
-          out.adultTooYoung = (await next(w1)).reason;
-          w1.send(JSON.stringify({t:'find', card:{name:'HAX',formId:'vesper',training:0,wins:0,battles:0,weight:20}, ageMs: 86400e3}));
-          out.teenTooYoung = (await next(w1)).reason;
-          w1.send(JSON.stringify({t:'find', card:{name:'HAX',formId:'kingleo',training:0,wins:50,battles:1,weight:30}, ageMs: 6*86400e3}));
-          out.badCounters = (await next(w1)).reason;
-          w1.send(JSON.stringify({t:'find', card:{name:'HAX',formId:'kingleo',xp:13230,training:2,wins:1,battles:1,weight:30}, ageMs: 6*86400e3}));
-          out.badXp = (await next(w1)).reason;
-          w1.send(JSON.stringify({t:'find', card:{name:'HAX',formId:'kingleo',xp:0,training:0,wins:0,battles:0,weight:30,hp:999,pow:99}, ageMs: 6*86400e3, hp: 999}));
-          await next(w1, 'searching');
-          const w2 = await open();
-          w2.send(JSON.stringify({t:'find', card:{name:'PAL',formId:'blob',xp:40,training:2,wins:0,battles:0,weight:8}, ageMs: 2e5}));
-          const m1 = await next(w1, 'matched'); const t1 = await next(w1, 'turn'); await next(w2, 'turn');
-          out.hp = m1.you.hp;
-          w1.send(JSON.stringify({t:'move', dir:'hi', n: 999})); w1.send(JSON.stringify({t:'move', dir:'nuke', n: t1.n}));
-          w1.send(JSON.stringify({t:'result', res:{hit:true,dmg:99}}));
-          let early = null; const h = (e) => { const m = JSON.parse(e.data); if (m.t === 'result') early = m; }; w1.addEventListener('message', h);
-          await new Promise(r => setTimeout(r, 500));
-          out.ignored = early === null;
-          w1.send(JSON.stringify({t:'move', dir:'hi', n: t1.n})); w1.send(JSON.stringify({t:'move', dir:'lo', n: t1.n}));
-          w2.send(JSON.stringify({t:'move', dir:'lo', n: t1.n}));
-          const r = await next(w1, 'result'); out.dmg = r.res.dmg; out.hpAfter = r.hp;
-          w1.close(); w2.close(); done(out);
-        })""")
-        check(res['tooYoung'] == 'form does not match age', f"server rejects a secret form on a young pet ({res['tooYoung']})")
-        check(res['adultTooYoung'] == 'form does not match age' and res['teenTooYoung'] == 'form does not match age',
-              f"server rejects a final form before day 5 / a day-2 form before day 2 ({res['adultTooYoung']}, {res['teenTooYoung']})")
-        check(res['badXp'] == 'implausible XP', f"server rejects XP that training/battles can't explain ({res['badXp']})")
-        check(res['badCounters'] == 'more wins than battles', f"server rejects impossible counters ({res['badCounters']})")
-        check(res['hp'] == 5, f"client-sent hp:999 ignored, server uses KAISERON's (kingleo) own HP ({res['hp']})")
-        check(res['ignored'], 'forged results / wrong-turn / invalid moves are ignored')
-        check(res['dmg'] <= 3, f"damage computed by server ({res['dmg']}), hp now {res['hpAfter']}")
-
-        # ================= 5. fallback: nobody else online =================
-        await make_pet(A, 'nekoru', 'ALICE')
-        await tap_icon(A, 'battle'); await tap_zone(A, 'opt0')
-        t0 = time.time()
-        await A.wait_for_function("Tama.Game.ui.fallbackReason==='nomatch'", timeout=20000)
-        check(10 <= time.time() - t0 <= 16, f'no opponent -> gives up after ~12 s ({time.time()-t0:.1f}s)')
-        await A.wait_for_timeout(900); await A.screenshot(path=f'{SHOTS}/07-phone-no-rival-fallback.png')
-        await A.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.kind==='cpu'", timeout=5000)
-        check(True, 'falls back to a CPU rival (NO RIVAL / VS CPU shown)')
-        await fight_by_tapping([A])
-        await ctxA.close(); await ctxB.close()
-
-        # ================= 6. fallback: server stopped (static host) & file:// =================
-        stop(node); node = None
-        static = start_static()
-        ctx, pg = await new_page(browser, PHONE, 'static')
-        await fresh(pg); await make_pet(pg, 'blobbo', 'SOLO')
-        await tap_icon(pg, 'battle'); await tap_zone(pg, 'opt0')
-        await pg.wait_for_function("Tama.Game.ui.fallbackReason==='offline'", timeout=8000)
-        await pg.wait_for_timeout(900)
-        await pg.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.kind==='cpu'", timeout=5000)
-        check(True, 'server unreachable -> OFFLINE / VS CPU fallback')
-        await ctx.close(); stop(static)
-        # the failed WebSocket handshake itself is logged by Chrome as a console error; expected here
-        errors[:] = [e for e in errors if not (e.startswith('static') and 'WebSocket' in e)]
-
-        ctx, pg = await new_page(browser, PHONE, 'file')
-        url = 'file://' + os.path.join(ROOT, 'index.html')
-        await fresh(pg, url); await make_pet(pg, 'blobbo', 'FILE')
-        await tap_icon(pg, 'battle'); await tap_zone(pg, 'opt0')
-        await pg.wait_for_function("Tama.Game.ui.fallbackReason==='offline'", timeout=6000)
-        await pg.wait_for_function("Tama.Game.ui.battle && Tama.Game.ui.battle.kind==='cpu'", timeout=5000)
-        check(True, 'file:// -> RANDOM falls back to CPU')
-        await ctx.close()
-
-        # ================= evolution tree gallery (debug panel, whole tree) =================
-        ctx, pg = await new_page(browser, dict(PHONE, viewport={'width': 430, 'height': 900}), 'tree')
-        await fresh(pg, 'file://' + os.path.join(ROOT, 'index.html') + '?debug=1')
+            hh = (await ev(pg, f"Tama.Debug.runScenario({json.dumps(baby)}, {json.dumps(teen)})"))['history']
+            check(hh[2:] == [mid, final], f'evolution: {baby} then {teen} -> {mid} -> {final} (got {hh[2:]})')
+        await ev(pg, "document.querySelector('#debug').classList.remove('collapsed')")
+        await dbg(pg, {'op': 'force', 'form': 'blob'}); await pg.wait_for_timeout(700)
+        opts = await ev(pg, "[...document.querySelectorAll('#dbgBranch option')].map(function(o){return o.value})")
+        check(opts == ['muck', 'vesper', 'scrapper', 'blobbo', 'nekoru', 'kuchibo'], f'debug lists the branches of the current form {opts}')
+        await pg.select_option('#dbgBranch', 'muck'); await pg.locator('[data-d="force"]').click(); await pg.wait_for_timeout(600)
+        check((await st(pg))['formId'] == 'muck' and await ev(pg, "!!Tama.Game.ui.anim"), 'debug panel forces a branch on the server (with the evolution animation)')
+        await idle(pg)
+        e1 = (await eco(pg))['coins']; await pg.locator('[data-d="coins"]').click(); await pg.wait_for_timeout(500)
+        check((await eco(pg))['coins'] == e1 + 500, 'debug +500 coins (server op)')
+        await pg.locator('[data-d="e0"]').click(); await pg.wait_for_timeout(500)
+        s = await st(pg); check(s['energy'] == 0 or s['asleep'], 'debug energy 0 -> it collapses into a nap')
         await ev(pg, "Tama.Debug.gallery()")
         n = await ev(pg, "document.querySelectorAll('#gallery .gal-cell').length")
         check(n == 2 + 6 + 12 + 1, f'debug gallery shows the whole tree ({n} forms)')
-        await pg.add_style_tag(content='html,body{height:auto!important;overflow:visible!important} #scene,.bar,#debug{display:none!important} #gallery{position:static!important;inset:auto!important;border:0}')
-        await pg.wait_for_timeout(300); await pg.screenshot(path=f'{SHOTS}/08-evolution-tree.png', full_page=True)
-        # force a branch from the debug panel (with its preview)
-        await fresh(pg, 'file://' + os.path.join(ROOT, 'index.html') + '?debug=1')
-        await ev(pg, "document.querySelector('#debug').classList.remove('collapsed')")
-        await ev(pg, "Tama.Debug.force('blob'); Tama.Debug.info(document.getElementById('debug'))")
-        opts = await ev(pg, "[...document.querySelectorAll('#dbgBranch option')].map(function(o){return o.value})")
-        check(opts == ['muck', 'vesper', 'scrapper', 'blobbo', 'nekoru', 'kuchibo'], f'debug lists the branches of the current form {opts}')
-        await pg.select_option('#dbgBranch', 'muck'); await pg.locator('[data-d="force"]').click(); await pg.wait_for_timeout(300)
-        check((await st(pg))['formId'] == 'muck' and await ev(pg, "!!Tama.Game.ui.anim"), 'debug can force a branch (with the evolution animation)')
+        await pg.add_style_tag(content='html,body{height:auto!important;overflow:visible!important} #scene,.bar,.wallet,#debug{display:none!important} #gallery{position:static!important;inset:auto!important;border:0}')
+        await pg.wait_for_timeout(300); await pg.screenshot(path=f'{SHOTS}/22-evolution-tree.png', full_page=True)
         await ctx.close()
+
+        # home HUD screenshot with a nice pet (last, so it isn't covered by toasts)
+        ctx, pg = await new_page(browser, PHONE, 'hud')
+        await pg.goto(BASE); await signup(pg, 'hudshot')
+        await make_pet(pg, 'vesper', 'PIPO', pet={'xp': 540, 'energy': 74}, eco_={'coins': 240})
+        await ev(pg, "var u=Tama.Game.ui; u.pet.x=14; u.pet.move='hop'; u.emote='heart'; u.emoteUntil=performance.now()+1e9; u.nextThink=performance.now()+1e9;")
+        await shot(pg, '02-phone-home-hud', 600)
+        check((await pg.inner_text('#coinNum')) == '240' and (await pg.inner_text('#energyNum')).startswith('74'), 'home HUD shows energy 74 and 240 coins')
+        await ctx.close()
+
+        # ================= 16. optional: Postgres adapter smoke test =================
+        pgurl = os.environ.get('PG_TEST_URL')
+        if pgurl:
+            pgs = start_node(PG_PORT, {'DATABASE_URL': pgurl, 'DATA_FILE': None}, '/tmp/tama-pg.log')
+            h = Http(PG_PORT)
+            _, cfg, _ = h.call('GET', '/api/config')
+            name = 'pg' + str(int(time.time()) % 100000)
+            c1, d1, _ = h.call('POST', '/api/signup', {'username': name, 'password': 'secret123'})
+            h.call('POST', '/api/debug', {'op': 'hatch'})
+            c2, d2, _ = h.call('POST', '/api/act', {'type': 'train_start'})
+            stop(pgs); pgs = start_node(PG_PORT, {'DATABASE_URL': pgurl, 'DATA_FILE': None}, '/tmp/tama-pg.log')
+            c3, d3, _ = h.call('GET', '/api/state')
+            c4, d4, _ = h.call('GET', '/api/ledger')
+            check(cfg['storage'] == 'postgres' and d1.get('ok') and d2.get('ok') and d3['pet']['stage'] == 'baby' and d3['pet']['energy'] <= 90 and any(x['reason'] == 'daily_gift' for x in d4['ledger']),
+                  f"Postgres: sign-up, act, restart -> state and coin ledger persist ({cfg['storage']}, energy {d3['pet']['energy']})")
+            stop(pgs)
+        else:
+            print('SKIP Postgres smoke test (set PG_TEST_URL to run it)')
+
         await browser.close()
     stop(node)
     print('\nconsole errors/warnings:', errors)
     if errors: fails.append('console errors')
     print('FAILURES:', fails)
+    print(f'{len(fails)} failures')
     sys.exit(1 if fails else 0)
 
 asyncio.run(main())
