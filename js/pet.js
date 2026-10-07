@@ -29,6 +29,8 @@
       // lifetime counters
       careMistakes: 0, poopMistakes: 0, meals: 0, snacks: 0, recentSnacks: 0,
       battles: 0, wins: 0, training: 0, plays: 0, xp: 0,
+      genes: T.Battle.rollGenes(),   // hidden per-pet stat bonus 0-15 each (server-side only, never sent to the browser)
+      peptides: 0,                    // Evolve Peptides used in the current stage
       st: T.Evolution.blankStageStats(),   // counters of the current stage (reset at each evolution)
     };
   }
@@ -51,7 +53,7 @@
     const from = s.formId;
     s.formId = to; s.stage = T.FORMS[to].stage; s.history.push(to);
     s.weight = Math.max(s.weight, C.MIN_WEIGHT[s.stage] || 5);
-    s.st = T.Evolution.blankStageStats();
+    s.st = T.Evolution.blankStageStats(); s.peptides = 0;
     ev.push({ type: 'evolve', from, to });
   }
 

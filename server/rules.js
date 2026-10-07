@@ -26,7 +26,7 @@ const MAX_EVENTS = 30;
 // ------------------------------------------------------------------ helpers
 function fail(error, msg, extra) { return Object.assign({ ok: false, error, msg }, extra || {}); }
 function push(game, e) { game.events.push(Object.assign({ at: Date.now() }, e)); if (game.events.length > MAX_EVENTS) game.events.splice(0, game.events.length - MAX_EVENTS); }
-function blankDaily() { return { drinks: 0, actions: 0, earnback: 0, battleCoins: 0, friendXp: 0, careActs: 0 }; }
+function blankDaily() { return { drinks: 0, actions: 0, earnback: 0, battleCoins: 0, friendXp: 0, careActs: 0, candy: 0 }; }
 function simNow(game, real) { return real + ((game.debug && game.debug.offset) || 0); }
 function dayKey(game, t) { return U.local(t, game.pet.tz || 'UTC').key; }
 
@@ -89,7 +89,10 @@ function upgrade(game) {
   game.events = game.events || []; game.debug = game.debug || { offset: 0, speed: 1 };
   game.eco.daily = Object.assign(blankDaily(), game.eco.daily || {});
   game.eco.inventory = Object.assign({ pickaxe: 1, ore: 0 }, game.eco.inventory || {});
-  game.pet = Object.assign(Pet.create(), game.pet);
+  const hadGenes = !!(game.pet && game.pet.genes);
+  game.pet = Object.assign(Pet.create(), game.pet);      // older pets get fresh random genes here (once; then stored)
+  if (!hadGenes || typeof game.pet.genes !== 'object') game.pet.genes = Battle.rollGenes();
+  game.pet.peptides = game.pet.peptides | 0;
   game.pet.st = Object.assign(Evolution.blankStageStats(), game.pet.st || {});
   return game;
 }
@@ -255,6 +258,18 @@ function actInner(game, a, real, tx) {
       } else if (k.kind === 'food') {
         const no = available(game, 'care'); if (no) return no;
         if (k.hunger && p.hunger >= 4) return fail('full', "It's not hungry.");
+      } else if (k.kind === 'candy') {
+        if (p.dead || p.stage === 'egg') return fail(p.dead ? 'dead' : 'egg', p.dead ? 'Your monster has died.' : "It's still an egg.");
+        if ((d.candy || 0) >= k.perDay) return fail('cap', 'One Rare Candy a day. More tomorrow!');
+        const L = Battle.levelFromXp(p.xp), cap = E.levelCap(p.stage);
+        if (L >= cap) return fail('level_cap', 'Already at the level cap (Lv ' + cap + ') for this stage. Evolve to go higher.');
+      } else if (k.kind === 'peptide') {
+        if (p.dead) return fail('dead', 'Your monster has died.');
+        if (p.stage === 'egg') return fail('egg', "It's still an egg.");
+        const left = Pet.evolvesIn(p);
+        if (left == null || !(T.EVOLUTION.tree[p.formId] || []).length) return fail('final', 'It has no further evolution.');
+        if (left <= 0) return fail('due', "It's about to evolve already.");
+        if ((p.peptides | 0) >= k.perStage) return fail('cap', 'Max ' + k.perStage + ' Evolve Peptides per stage.');
       } else if (k.kind === 'tool') {
         const inv = game.eco.inventory;
         if ((inv[k.tool] || 1) >= k.tier) return fail('owned', 'You already have this.');
@@ -268,7 +283,21 @@ function actInner(game, a, real, tx) {
         if (k.happy) { p.happy = Math.min(4, p.happy + k.happy); p.snacks++; p.st.snacks = (p.st.snacks || 0) + 1; }
         p.weight += k.weight || 0;
       } else if (k.kind === 'tool') game.eco.inventory[k.tool] = k.tier;
-      return { ok: true, sku: k.id, coins: game.eco.coins, energy: p.energy, drinksLeft: k.perDay ? k.perDay - d.drinks : null };
+      const out = { ok: true, sku: k.id, coins: game.eco.coins, energy: p.energy, drinksLeft: k.kind === 'drink' ? k.perDay - d.drinks : null };
+      if (k.kind === 'candy') {
+        d.candy = (d.candy || 0) + 1;
+        const L = Battle.levelFromXp(p.xp) + 1;
+        p.xp = Math.max(p.xp | 0, Battle.xpFor(L));          // start of the next level
+        out.level = Battle.levelFromXp(p.xp);
+        push(game, { type: 'levelUp', level: out.level });
+      } else if (k.kind === 'peptide') {
+        // the pet's evolution clock jumps 12 h ahead (its wall clock for sleeping stays the same);
+        // what it evolves into is still decided by its record when the time comes
+        const left = Pet.evolvesIn(p), cut = Math.min(k.cutMs, left);
+        p.ageMs += cut; p.createdAt -= cut; p.peptides = (p.peptides | 0) + 1;
+        out.cutMs = cut; out.evolvesIn = Pet.evolvesIn(p); out.peptidesLeft = k.perStage - p.peptides;
+      }
+      return out;
     }
     case 'new_egg': {
       if (!p.dead) return fail('alive', 'Your monster is still alive.');
@@ -312,6 +341,10 @@ function card(game) { return Battle.card(game.pet); }
 /** What the client gets. events = the queued events drained for this response (see server mutate). */
 function view(game, real, events) {
   const p = clone(game.pet);
+  // stats are computed here; the hidden genes never leave the server (only a vague rating does)
+  p.stats = Battle.stats(p.formId, Battle.levelFromXp(p.xp), game.pet.genes, Battle.isHeavy(p));
+  p.potential = Battle.potential(game.pet.genes);
+  delete p.genes;
   const lj = game.eco.lastJob;
   const out = {
     pet: p,

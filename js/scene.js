@@ -383,16 +383,17 @@
     const [ax, ay] = this._pt(x, y), [bx, by] = this._pt(x + w, y + h);
     this.tq.push({ k: fill ? 'fill' : 'clear', x: Math.min(ax, bx), y: Math.min(ay, by), w: Math.abs(bx - ax), h: Math.abs(by - ay), c: fill, a: this.ctx.globalAlpha });
   };
-  /** Paint the queued UI text (call once at the end of each frame). */
+  /** Paint the queued UI text (call once at the end of each frame). Text is drawn at its real device-pixel size
+   *  (no scale transform): Safari rounds/clamps tiny canvas font sizes, which made drawn text wider than measured. */
   P.flush = function () {
-    const g = this.tctx, k = this.scale * this.dpr;
+    const g = this.tctx, k = this.scale * this.dpr, fpx = FS * k;
     g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, this.tc.width, this.tc.height);
-    g.setTransform(k, 0, 0, k, 0, 0); g.textBaseline = 'alphabetic';
+    g.textBaseline = 'alphabetic';
     for (const o of this.tq) {
       g.globalAlpha = o.a;
-      if (o.k === 'clear') g.clearRect(o.x, o.y, o.w, o.h);
-      else if (o.k === 'fill') { g.fillStyle = o.c; g.fillRect(o.x, o.y, o.w, o.h); }
-      else { g.font = fontFor(o.s, FS); g.fillStyle = o.c; g.fillText(o.s, o.x, o.y); }
+      if (o.k === 'clear') g.clearRect(o.x * k, o.y * k, o.w * k, o.h * k);
+      else if (o.k === 'fill') { g.fillStyle = o.c; g.fillRect(o.x * k, o.y * k, o.w * k, o.h * k); }
+      else { g.font = fontFor(o.s, fpx); g.fillStyle = o.c; g.fillText(o.s, o.x * k, o.y * k); }
     }
     g.globalAlpha = 1;
   };
@@ -432,14 +433,21 @@
   P.textMid = function (s, x, y, h, c) {
     this.text(s, x, y + Math.floor((h - T.FONT_H) / 2), c);
   };
+  /** Centred one-or-more-line label in a box sized from the real font (+ padding), kept inside the screen. */
   P.label = function (s, y, c, cx) {
-    const lines = this.wrap(s, this.W - 14), tw = Math.max(...lines.map(l => this.textW(l)));
-    const w = tw + 8, x = cx != null ? Math.round(cx - w / 2) : Math.floor((this.W - w) / 2);
+    const b = this.bounds(), sw = Math.min(this.W, b.right - b.left);
+    const lines = this.wrap(s, sw - 16), tw = Math.ceil(Math.max(...lines.map(l => this.textW(l))));
+    const w = Math.min(b.right - b.left - 2, tw + 10);
+    let x = cx != null ? Math.round(cx - w / 2) : Math.floor((this.W - w) / 2);
+    x = Math.max(b.left + 1, Math.min(b.right - 1 - w, x));
+    const pad = Math.floor((w - tw) / 2);
     this.panel(x, y - 2, w, 11 + (lines.length - 1) * 9);
-    lines.forEach((l, i) => this.text(l, x + 4 + Math.floor((tw - this.textW(l)) / 2), y + i * 9, c));
+    lines.forEach((l, i) => this.text(l, x + pad + Math.floor((tw - this.textW(l)) / 2), y + i * 9, c));
     return y - 2 + 11 + (lines.length - 1) * 9;       // bottom edge of the panel
   };
   P.button = function (x, y, w, h, label, hi, color) {
+    const need = Math.ceil(this.textW(label)) + 4;    // never narrower than its own text
+    if (need > w) { x -= Math.ceil((need - w) / 2); w = need; }
     this.panel(x, y, w, h, hi ? UI.accent : null);
     this.textMid(label, x + Math.floor((w - this.textW(label)) / 2), y, h, color || (hi ? UI.accent : UI.text));
   };

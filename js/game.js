@@ -17,7 +17,7 @@
                    discipline: 'Discipline', battle: 'Battle', attention: 'Needs attention', back: 'Back', home: 'Main menu' };
   const EMOTE_COL = { heart: '#c9505a', note: '#9fb3d1', angry: '#d0503c', zzz: '#9fb0d0', sweat: '#7fb4d8',
                       question: '#d8dde6', food: '#d8c9a0', skull: '#d8dde6', excl: UI.accent };
-  const STATUS_PAGES = 5, HELP_PAGES = 6;
+  const STATUS_PAGES = 6, HELP_PAGES = 6;
   const NOTIFY_KEY = 'tamapix.notify';
 
   let S, hud = {}, state, eco, chal = { incoming: [], outgoing: [] }, user = null, cfg = {}, ui;
@@ -445,6 +445,7 @@
       ['JOBS', J.concat(['The pet is away and gets hungry faster.'])],
       ['SHOP', E.SKUS.map(k => k.name + ' ' + k.price.coins + 'c: ' + k.desc)],
       ['XP', ['First ' + E.TAPER[0].upTo + ' energy actions a day: full XP, next ' + (E.TAPER[1].upTo - E.TAPER[0].upTo) + ' half, then a quarter.',
+              'Stats (HP, Attack, Defence, Speed) grow every level. Rarer forms have higher base stats, and no two monsters are the same.',
               'Level caps: baby ' + C.LEVEL_CAP.baby + ', day-2 form ' + C.LEVEL_CAP.teen + ', final ' + C.LEVEL_CAP.adult + '.', 'Friend battles: XP from ' + E.FRIEND_XP_PER_DAY + ' a day, no coins.']]
     ][i];
   }
@@ -477,7 +478,7 @@
     const b = S.bounds(), x = 3, w = W - 6, y = Math.max(b.top + 2, -58), h = Math.max(96, Math.min(106, b.bottom - 2 - y));
     S.panel(x, y, w, h);
     const fit = (str, cx0) => fitText(str, x + w - 5 - cx0);
-    const titles = ['PROFILE', 'CARE', 'ENERGY', 'WALLET', 'RECORD'];
+    const titles = ['PROFILE', 'STATS', 'CARE', 'ENERGY', 'WALLET', 'RECORD'];
     S.textMid(titles[ui.page], x + 5, y + 2, 12, UI.accent);
     const pgS = (ui.page + 1) + '/' + STATUS_PAGES; S.textMid(pgS, x + w - 5 - S.textW(pgS), y + 2, 12, UI.dim);
     S.rule(x + 4, y + 15, w - 8);
@@ -497,13 +498,27 @@
         S.text(fit(evolveLine(s), cx), cx, y + 83, Pet.evolvesIn(s) == null ? UI.dim : UI.text);
         break;
       }
-      case 1:
+      case 1: {
+        if (s.stage === 'egg' || !s.stats) { S.text(fit('Hatch it to see its stats.', cx), cx, cy, UI.dim); break; }
+        S.text(fit('Lv ' + L + ' / ' + E.levelCap(s.stage) + '  ' + f.name, cx), cx, cy, UI.text);
+        const rows = [['HP', 'hp', 320, UI.green], ['Attack', 'atk', 230, UI.red], ['Defence', 'def', 230, UI.blue], ['Speed', 'spd', 230, UI.yellow]];
+        const lw = Math.ceil(Math.max(...rows.map(r => S.textW(r[0])))) + 3, vw = Math.ceil(S.textW('000')) + 2;
+        rows.forEach(([lab, k, max, col], i) => {
+          const ry = cy + 11 + i * 11, v = s.stats[k] | 0, vs = String(v);
+          S.text(lab, cx, ry, UI.dim);
+          S.text(vs, x + w - 5 - S.textW(vs), ry, UI.text);
+          bar(cx + lw, ry + 1, x + w - 5 - vw - (cx + lw), v / max, col);
+        });
+        S.text(fit(s.potential || '', cx), cx, cy + 57, UI.accent);
+        break;
+      }
+      case 2:
         S.text(fit('Hunger', cx), cx, cy, UI.dim); pips(cx, cy + 9, s.hunger, 4, UI.accent);
         S.text(fit('Mood', cx), cx, cy + 20, UI.dim); pips(cx, cy + 29, s.happy, 4, UI.blue);
         S.text(fit('Weight ' + s.weight + '   Mistakes ' + s.careMistakes, cx), cx, cy + 42, UI.dim);
         S.text(fit(s.sick ? 'Sick!' : s.poops.length ? 'Needs cleaning' : 'Healthy', cx), cx, cy + 54, s.sick ? UI.red : UI.text);
         break;
-      case 2: {
+      case 3: {
         const EN = C.ENERGY, nActs = eco ? eco.daily.actions : 0;
         S.text(fit('Energy ' + energy() + ' / ' + EN.MAX, cx), cx, cy, UI.text);
         bar(cx, cy + 10, w - 12, (s.energy || 0) / EN.MAX, UI.yellow);
@@ -515,7 +530,7 @@
         S.text(fit('Fizz today ' + (eco ? eco.daily.drinks : 0) + '/' + E.sku('fizz').perDay, cx), cx, cy + 54, UI.dim);
         break;
       }
-      case 3: {
+      case 4: {
         const inv = (eco && eco.inventory) || {};
         S.text(fit('Coins ' + (eco ? eco.coins : 0), cx), cx, cy, UI.accent);
         S.text(fit('Ore ' + (inv.ore || 0), cx), cx, cy + 10, UI.text);
@@ -525,7 +540,7 @@
         S.text(fit('Login gift day ' + (((eco && eco.gift.idx) || 0) || 7) + '/7', cx), cx, cy + 52, UI.dim);
         break;
       }
-      case 4: {
+      case 5: {
         const st = s.st || {};
         S.text(fit('Wins ' + s.wins + '  Losses ' + (s.battles - s.wins), cx), cx, cy, UI.text);
         S.text(fit('Training ' + s.training, cx), cx, cy + 10, UI.text);
@@ -536,7 +551,7 @@
         break;
       }
     }
-    for (let i = 0; i < STATUS_PAGES; i++) S.rect(x + w / 2 - 12 + i * 6, y + h - 8, 3, 3, i === ui.page ? UI.accent : '#4a5366');
+    for (let i = 0; i < STATUS_PAGES; i++) S.rect(x + w / 2 - STATUS_PAGES * 3 + i * 6, y + h - 8, 3, 3, i === ui.page ? UI.accent : '#4a5366');
     if (blink(t, 500)) S.text('>', x + w - 10, y + h - 11, UI.accent);
     zone(-20, -90, W + 40, H + 140, nextStatusPage, { x: x + w - 14, y: y + h - 14, w: 10, h: 10 }, 'status');
   }
@@ -574,6 +589,16 @@
         if (left <= 0) dimRow = true;
       }
       if (k.kind === 'tool' && (inv[k.tool] || 1) >= k.tier) { right = 'OWNED'; dimRow = true; }
+      if (k.kind === 'candy') {
+        const used = (d.candy || 0) >= k.perDay, capped = hatched() && Pet.level(state) >= E.levelCap(state.stage);
+        sub = '+1 level · ' + (used ? 'used today' : capped ? 'at level cap' : '1 a day');
+        if (used || capped) dimRow = true;
+      }
+      if (k.kind === 'peptide') {
+        const left = k.perStage - (state.peptides || 0), evo = hatched() && Pet.evolvesIn(state) != null;
+        sub = '-12 h to evolve · ' + (!evo ? 'no evolution' : left > 0 ? left + ' left' : 'max used');
+        if (!evo || left <= 0) dimRow = true;
+      }
       const row = { label: k.name, sub, dim: dimRow, id: 'sku_' + k.id };
       if (right) row.right = right;
       else row.btn = { label: price + 'c', dim: poor || dimRow, fn: () => askBuy(k), id: 'buy_' + k.id };
@@ -583,6 +608,16 @@
   function askBuy(k) {
     const d = (eco && eco.daily) || {};
     if (k.kind === 'drink' && (d.drinks || 0) >= k.perDay) { A.sfx('no'); return toast("Enough fizz for today!", 'The limit resets at midnight.'); }
+    if (k.kind === 'candy') {
+      if (!hatched()) { A.sfx('no'); return toast("It's still an egg.", 'Rare Candy works once it hatches.'); }
+      if ((d.candy || 0) >= k.perDay) { A.sfx('no'); return toast('One Rare Candy a day.', 'More tomorrow!'); }
+      if (Pet.level(state) >= E.levelCap(state.stage)) { A.sfx('no'); return toast('Already at the level cap (Lv ' + E.levelCap(state.stage) + ').', 'Evolve to raise the cap.'); }
+    }
+    if (k.kind === 'peptide') {
+      if (!hatched()) { A.sfx('no'); return toast("It's still an egg.", 'Peptides work once it hatches.'); }
+      if (Pet.evolvesIn(state) == null) { A.sfx('no'); return toast('No further evolution.', 'This is its final form.'); }
+      if ((state.peptides || 0) >= k.perStage) { A.sfx('no'); return toast('Max ' + k.perStage + ' peptides per stage.', 'The limit resets when it evolves.'); }
+    }
     if (eco.coins < k.price.coins) { A.sfx('no'); return toast('Not enough coins (' + eco.coins + '/' + k.price.coins + ').', 'Earn them: jobs, battles, daily care.'); }
     confirmBox('BUY?', [k.name + ' for ' + k.price.coins + ' coins?', k.desc, 'You have ' + eco.coins + ' coins.'], { label: 'BUY', fn: () => buy(k) }, 'CANCEL', 'buy');
   }
@@ -592,6 +627,8 @@
     A.sfx('ok');
     if (k.kind === 'drink') { toast('Glug glug! +' + k.energy + ' energy.', d.drinksLeft + ' fizz left today.'); }
     else if (k.kind === 'food') { back(); eatAnim(k.hunger ? 'meat' : 'berry', 'ok'); }
+    else if (k.kind === 'candy') toast('Yum! ' + state.name + ' reached Lv ' + d.level + '!', 'Its stats went up. See Status > Stats.');
+    else if (k.kind === 'peptide') toast('Evolution 12 h sooner!', d.evolvesIn > 0 ? 'Evolves in ' + fmtDur(d.evolvesIn) + '. ' + d.peptidesLeft + ' left this stage.' : 'It is ready to evolve!');
     else toast(k.name + ' bought!', k.desc);
   }
 
@@ -1000,7 +1037,7 @@
     S.text(name, x + 5, y + 4, UI.text);
     S.hpBar(x + 5, y + 13, w - 10, hp, f.max);
     S.text(lv, x + 5, y + 21, UI.dim);
-    if (nums) { const n = Math.ceil(hp * 10) + '/' + f.max * 10; S.text(n, x + w - 5 - S.textW(n), y + 21, UI.text); }
+    if (nums) { const n = Math.ceil(hp) + '/' + f.max; S.text(n, x + w - 5 - S.textW(n), y + 21, UI.text); }
   }
   function textBox(L, lines, color) {
     S.panel(0, L.tb, W, 38);
@@ -1061,13 +1098,13 @@
           const fy = ty + (r.dir === 'hi' ? Math.round(th * 0.3) : Math.round(th * 0.72));
           if (r.hit) {
             if (Math.floor(el / 70) % 2) { if (mine) oppWhite = true; else meWhite = true; }
-            shake = (Math.floor(el / 40) % 2 ? 1 : -1) * (r.dmg > 1 ? 2 : 1);
+            shake = (Math.floor(el / 40) % 2 ? 1 : -1) * (r.crit ? 2 : 1);
             fx = { type: 'slash', x: tx + Math.floor(tw / 2), y: fy };
           } else if (r.blocked || r.absorbed) fx = { type: 'block', x: tx + (mine ? -2 : tw + 1), y: fy };
           else if (r.dodged) { if (mine) opX += 8; else myX -= 8; }
         }
         if (el > 1000) {
-          const out = r.hit ? (r.dmg > 1 ? 'A crushing blow!' : 'It hit ' + defName + '!') :
+          const out = r.hit ? (r.crit ? 'A crushing blow!' : 'It hit ' + defName + '!') :
             r.blocked ? defName + ' blocked it!' : r.dodged ? defName + ' dodged the attack!' : r.absorbed ? defName + ' absorbed the blow!' :
             r.heal ? '' : 'Nothing happened.';
           msg = msgLines([out, r.heal ? atkName + ' recovered HP!' : ''].filter(Boolean).join(' '));

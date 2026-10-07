@@ -296,6 +296,8 @@ async function ghostCard(uid) {
 function startBattle(kind, sides, extra) {
   const B = Object.assign({ id: Math.random().toString(36).slice(2, 8), kind, sides, attacker: Math.random() < 0.5 ? 0 : 1, turn: 0, moves: [null, null], timer: null, over: false }, extra || {});
   sides.forEach((s, i) => { s.f = Battle.fighter(s.card); if (s.ws) { s.ws.battle = B; s.ws.side = i; } });
+  const sp = sides.map(s => s.f.st.spd);                  // the faster monster attacks first (ties: coin flip)
+  if (sp[0] !== sp[1]) B.attacker = sp[0] > sp[1] ? 0 : 1;
   battles.add(B);
   log('battle', B.id, kind, sides.map(s => s.card.name + '/' + s.card.formId + (s.ws ? '' : '(cpu)')).join(' vs '));
   sides.forEach((s, i) => send(s.ws, { t: 'matched', id: B.id, kind, you: Battle.view(s.f), opp: Battle.view(sides[1 - i].f), ghost: !sides[1 - i].ws }));

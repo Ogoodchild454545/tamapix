@@ -189,7 +189,7 @@ thought: ${T.Game.ui.thought || '-'}`;
       g = document.createElement('div'); g.id = 'gallery';
       const F = T.FORMS, E = T.EVOLUTION;
       const cell = (k, cond) => {
-        const f = F[k], st = f.stats ? `HP${f.stats.hp} P${f.stats.pow} D${f.stats.def} S${f.stats.spd}` : '';
+        const f = F[k], st = f.stats ? `HP${f.stats.hp} A${f.stats.atk} D${f.stats.def} S${f.stats.spd}` : '';
         return `<div class="gal-cell${f.secret ? ' secret' : ''}" data-form="${k}"><canvas data-k="${k}"></canvas><b>${f.name}</b>` +
           (cond ? `<em>${cond}</em>` : '') + `<span>${f.desc}</span>` + (st ? `<span>${st}${f.special ? ' &middot; ' + f.special.name : ''}</span>` : '') + '</div>';
       };

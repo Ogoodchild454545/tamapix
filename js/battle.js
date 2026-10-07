@@ -4,12 +4,16 @@
  *
  * Levels (1-50) come ONLY from XP, and XP only from training sessions and battles (see XP below). XP per action
  * grows a little with your level (x(1 + (L-1)/10)) so the per-stage level caps (BLOB 10, day-2 25, final 40) are
- * reachable on free energy. The level adds a little to every battle stat.
+ * reachable on free energy.
+ *
+ * Stats (Pokemon-style): HP, ATK, DEF, SPD = form base stats (evolution.js) + a hidden per-pet gene 0-15 for each,
+ * growing with level: stat = floor((2*base + gene) * L / 50) + 5; HP = floor((2*base + gene) * L / 50) + L + 10.
+ * Genes are rolled once per pet on the server and never sent to the browser.
  * Cards are always built by the SERVER from the pet it stores (friend codes are server-issued ids, see server/).
  *
  * Round: you pick HIGH (A) or LOW (B). The defender guesses a guard direction; a CPU
- * leans towards whatever you did last, so mix it up. Stats: hp = health, pow = damage,
- * def = resist extra damage, spd = better guarding. Every 3rd attack fires the species'
+ * leans towards whatever you did last, so mix it up. Stats: hp = health, atk vs def = damage,
+ * spd = better guarding / side-steps, and the faster monster attacks first. Every 3rd attack fires the species'
  * special move (see evolution.js).
  */
 (function (T) {
@@ -44,54 +48,84 @@
       return 0;
     },
 
-    card(s) {
-      return { name: s.name, formId: s.formId, xp: s.xp | 0, training: s.training, wins: s.wins, battles: s.battles, weight: s.weight };
+    // ---------- stats ----------
+    STAT_KEYS: ['hp', 'atk', 'def', 'spd'],
+    DOUBLE_MUL: 1.3,                                // 'double' specials: an unblockable x1.3 hit
+    GENE_MAX: 15,
+    /** A fresh random set of hidden genes (0-15 per stat). */
+    rollGenes() { const g = {}; this.STAT_KEYS.forEach(k => (g[k] = Math.floor(Math.random() * (this.GENE_MAX + 1)))); return g; },
+    /** Vague rating of a gene set (shown instead of the genes). */
+    potential(g) {
+      const n = g ? this.STAT_KEYS.reduce((m, k) => m + (g[k] | 0), 0) : 30;
+      return n >= 48 ? 'Outstanding potential' : n >= 36 ? 'Great potential' : n >= 22 ? 'Good potential' : 'Modest potential';
     },
-    /** Public view of a fighter (what an opponent / the server sends). */
-    view(f) { return { card: f.card, hp: f.hp, max: f.max, st: { hp: f.st.hp, pow: f.st.pow, def: f.st.def, spd: f.st.spd, special: f.st.special } }; },
-    /** Battle stats: species base + level bonus (+1 HP per 15 levels, +1 POW per 12, +1 DEF per 18, +1 SPD per 25). */
+    /** Level-scaled stats of a form: {hp, atk, def, spd}. heavy = overweight (+10% HP/DEF, -10% SPD). */
+    stats(formId, level, genes, heavy) {
+      const f = T.FORMS[formId] || T.FORMS.blob, b = f.stats || T.FORMS.blob.stats, g = genes || {};
+      const L = Math.max(1, Math.min(this.XP.MAX_LEVEL, level | 0)), o = {};
+      for (const k of this.STAT_KEYS) {
+        const core = Math.floor((2 * b[k] + U.clamp(g[k] | 0, 0, this.GENE_MAX)) * L / 50);
+        o[k] = k === 'hp' ? core + L + 10 : core + 5;
+      }
+      if (heavy) { o.hp = Math.round(o.hp * 1.1); o.def = Math.round(o.def * 1.1); o.spd = Math.max(1, Math.round(o.spd * 0.9)); }
+      return o;
+    },
+    isHeavy(card) { const f = T.FORMS[card.formId] || T.FORMS.blob; return card.weight >= (T.CONFIG.MIN_WEIGHT[f.stage] || 5) + 20; },
+
+    /** Battle card, built by the server from the stored pet (genes included: server-side only, see view()). */
+    card(s) {
+      return { name: s.name, formId: s.formId, xp: s.xp | 0, training: s.training, wins: s.wins, battles: s.battles, weight: s.weight, genes: s.genes || null };
+    },
+    /** Public view of a fighter (what an opponent / the server sends). Never includes the hidden genes. */
+    view(f) {
+      const c = f.card;
+      return { card: { name: c.name, formId: c.formId, xp: c.xp, training: c.training, wins: c.wins, battles: c.battles, weight: c.weight },
+               hp: f.hp, max: f.max, st: { hp: f.st.hp, atk: f.st.atk, def: f.st.def, spd: f.st.spd, special: f.st.special } };
+    },
+    /** Battle stats of a card: the level-scaled stats + the form's special move. */
     statsFor(card) {
       const f = T.FORMS[card.formId] || T.FORMS.blob;
-      const b = f.stats || { hp: 2, pow: 1, def: 1, spd: 1 };
-      const L = this.level(card);
-      const heavy = card.weight >= (T.CONFIG.MIN_WEIGHT[f.stage] || 5) + 20 ? 1 : 0;
-      return {
-        hp: b.hp + heavy + Math.floor(L / 15),
-        pow: b.pow + Math.floor(L / 12),
-        def: b.def + heavy + Math.floor(L / 18),
-        spd: Math.max(1, b.spd - heavy + Math.floor(L / 25)),
-        special: f.special
-      };
+      return Object.assign(this.stats(card.formId, this.level(card), card.genes, this.isHeavy(card)), { special: f.special });
+    },
+    /** Speed edge of the defender over the attacker (-1..1). */
+    spdEdge(d, a) { return (d.st.spd - a.st.spd) / Math.max(1, d.st.spd + a.st.spd); },
+    /** Normal hit damage: 0.4 x a level reference (the HP of a base-60 monster at the fighters' average level) x
+     *  (ATK/DEF)^0.25 (clamped 0.6-1.6), x0.85-1 random. HP, ATK, DEF and level all count, but a stronger monster
+     *  wins more often rather than every time (about 3-5 landed hits KO an equal foe). */
+    damage(a, d) {
+      const L = (this.level(a.card) + this.level(d.card)) / 2, ref = Math.floor(128 * L / 50) + L + 10;
+      const r = U.clamp(Math.pow(a.st.atk / Math.max(1, d.st.def), 0.25), 0.6, 1.6);
+      return Math.max(1, Math.round(0.4 * ref * r * U.rand(0.85, 1)));
     },
     fighter(card) {
       const st = this.statsFor(card);
       return { card, name: card.name, form: T.FORMS[card.formId], st, hp: st.hp, max: st.hp,
                turns: 0, guardNext: false, dodgeNext: false, absorbNext: false, stunned: false, lastDir: null };
     },
-    /** A computer rival of the same stage, around your level (-2 .. +3, within the stage's level cap). */
+    /** A computer rival of the same stage, around your level (-2 .. +2, within the stage's level cap). */
     cpuCard(stage, myLevel) {
       const st = stage === 'egg' ? 'baby' : stage;
       const pool = T.Evolution.formsByStage(st);
-      const lvl = U.clamp((myLevel || 1) + Math.floor(U.rand(-2, 4)), 1, T.CONFIG.LEVEL_CAP[st] || this.XP.MAX_LEVEL);
+      const lvl = U.clamp((myLevel || 1) + Math.floor(U.rand(-2, 3)), 1, T.CONFIG.LEVEL_CAP[st] || this.XP.MAX_LEVEL);
       const battles = Math.floor(U.rand(0, lvl));
       return { name: T.Pet.randomName(), formId: U.pick(pool), xp: this.xpFor(lvl) + Math.floor(U.rand(0, 10)), training: Math.floor(U.rand(0, lvl * 2)),
-               battles, wins: Math.floor(battles * U.rand(0.2, 0.8)), weight: T.CONFIG.MIN_WEIGHT[st] + Math.floor(U.rand(0, 12)) };
+               battles, wins: Math.floor(battles * U.rand(0.2, 0.8)), weight: T.CONFIG.MIN_WEIGHT[st] + Math.floor(U.rand(0, 12)), genes: this.rollGenes() };
     },
 
     /** Resolve one attack. dir = 'hi' | 'lo'. guessDir = defender's guard guess (optional). */
     attack(a, d, dir, guessDir) {
       a.turns++;
-      const res = { dir, special: null, hit: false, dmg: 0, heal: 0, blocked: false, dodged: false, absorbed: false, stunned: false };
+      const res = { dir, special: null, hit: false, dmg: 0, heal: 0, crit: false, blocked: false, dodged: false, absorbed: false, stunned: false };
       if (a.stunned) { a.stunned = false; res.stunned = true; return res; }
       const sp = a.st.special && a.turns % 3 === 0 ? a.st.special : null;
-      let dmgMul = 1, unblockable = false, flat = 0;
+      let dmgMul = 1, unblockable = false, flat = 0, drain = false;
       if (sp) {
         res.special = sp.name;
         switch (sp.type) {
-          case 'double': dmgMul = 2; unblockable = true; break;
-          case 'inferno': flat = 3; unblockable = true; break;
-          case 'drain': flat = 1; unblockable = true; res.heal = 1; break;
-          case 'heal': res.heal = 2; break;
+          case 'double': dmgMul = this.DOUBLE_MUL; unblockable = true; break;
+          case 'inferno': flat = Math.round(this.damage(a, d) * 2); unblockable = true; break;
+          case 'drain': flat = this.damage(a, d); unblockable = true; drain = true; break;
+          case 'heal': res.heal = Math.max(1, Math.round(a.max * 0.3)); break;
           case 'fullheal': res.heal = a.max; break;
           case 'guard': a.guardNext = true; break;
           case 'dodge': a.dodgeNext = true; break;
@@ -105,23 +139,29 @@
       if (d.guardNext && !unblockable) { d.guardNext = false; res.blocked = true; return res; }
       if (!unblockable) {
         if (guessDir == null) {
-          const p = U.clamp(0.4 + (d.st.spd - a.st.spd) * 0.07, 0.15, 0.7);
+          const p = U.clamp(0.4 + this.spdEdge(d, a) * 0.6, 0.15, 0.7);
           res.blocked = Math.random() < p;
         } else {
           res.blocked = guessDir === dir;
           // a faster defender can still side-step a hit it misread
-          if (!res.blocked && Math.random() < U.clamp((d.st.spd - a.st.spd) * 0.05, 0, 0.25)) { res.dodged = true; return res; }
+          if (!res.blocked && Math.random() < U.clamp(this.spdEdge(d, a) * 0.5, 0, 0.25)) { res.dodged = true; return res; }
         }
         if (res.blocked) return res;
       }
-      let dmg = flat || (1 + (Math.random() < U.clamp(0.15 + (a.st.pow - d.st.def) * 0.15, 0.05, 0.6) ? 1 : 0)) * dmgMul;
-      if (d.absorbNext && !flat) { d.absorbNext = false; d.hp = Math.min(d.max, d.hp + 1); res.absorbed = true; return res; }
+      let dmg = flat;
+      if (!flat) {
+        const edge = (a.st.atk - d.st.def) / Math.max(1, a.st.atk + d.st.def);
+        res.crit = Math.random() < U.clamp(0.12 + edge * 0.4, 0.05, 0.35);
+        dmg = Math.round(this.damage(a, d) * dmgMul * (res.crit ? 1.5 : 1));
+      }
+      if (d.absorbNext && !flat) { d.absorbNext = false; d.hp = Math.min(d.max, d.hp + Math.max(1, Math.round(d.max * 0.15))); res.absorbed = true; return res; }
       d.hp = Math.max(0, d.hp - dmg); res.hit = true; res.dmg = dmg;
+      if (drain) { res.heal = Math.max(1, Math.round(dmg / 2)); a.hp = Math.min(a.max, a.hp + res.heal); }
       return res;
     },
     /** CPU guard guess against the player's attack: leans towards repeating player's last direction. */
     cpuGuess(opp, me) {
-      const lean = U.clamp(0.55 + (opp.st.spd - me.st.spd) * 0.05, 0.4, 0.75);
+      const lean = U.clamp(0.55 + this.spdEdge(opp, me) * 0.4, 0.4, 0.75);
       if (!me.lastDir) return U.pick(['hi', 'lo']);
       return Math.random() < lean ? me.lastDir : (me.lastDir === 'hi' ? 'lo' : 'hi');
     },

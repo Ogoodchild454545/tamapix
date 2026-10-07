@@ -5,7 +5,9 @@
  * Age is real time since hatching (CONFIG.T.TEEN_AT / ADULT_AT). A pet only evolves while awake, so an evolution
  * that falls due at night happens when it wakes up.
  *
- * FORMS: every species. stage = baby | teen (day-2 form) | adult (final). stats = battle stats {hp, pow, def, spd};
+ * FORMS: every species. stage = baby | teen (day-2 form) | adult (final). stats = BASE battle stats {hp, atk, def, spd}
+ *        (tiers by total: BLOB 120, day-2 forms 190-220, common finals 280, harder finals 320, the two hardest 360,
+ *        secret DRAKON 420);
  *        special = battle move that fires on every 3rd attack; move = basic attack name; traits feed personality.
  *        Form ids are internal (kept stable for saves / friend codes); `name` is what the player sees.
  * TREE:  for each form, the ordered list of branches it can evolve into. At evolution time the FIRST branch whose
@@ -15,55 +17,55 @@
  */
 (function (T) {
   'use strict';
-  const S = (hp, pow, def, spd) => ({ hp, pow, def, spd });
+  const S = (hp, atk, def, spd) => ({ hp, atk, def, spd });   // BASE stats (see Tama.Battle.statsFor)
   const C = T.CONFIG.T;
 
   // special.type: double | heal | guard | dodge | absorb | drain | stun | inferno | fullheal
   T.FORMS = {
     egg:      { name: 'EGG', stage: 'egg', desc: 'A dark, humming egg.' },
-    blob:     { name: 'BLOB', move: 'ENGULF', stage: 'baby', stats: S(2, 1, 1, 1), special: null,
+    blob:     { name: 'BLOB', move: 'ENGULF', stage: 'baby', stats: S(30, 30, 30, 30), special: null,
                 traits: { cheer: 0.4, temper: 0.3, lazy: 0.5 }, desc: 'Every pet hatches as this shapeless mass.' },
 
     // ---- day-2 forms (stage "teen")
-    vesper:   { name: 'VESPERAN', move: 'DUSK TALON', stage: 'teen', stats: S(4, 3, 2, 3), special: { name: 'NIGHT DIVE', type: 'dodge' },
+    vesper:   { name: 'VESPERAN', move: 'DUSK TALON', stage: 'teen', stats: S(55, 60, 45, 60), special: { name: 'NIGHT DIVE', type: 'dodge' },
                 traits: { cheer: 0.4, temper: 0.6, lazy: 0.2 }, desc: 'Young dark angel. Born of victory.' },
-    scrapper: { name: 'TALONIX', move: 'CLAW STRIKE', stage: 'teen', stats: S(4, 3, 2, 2), special: { name: 'TALON RUSH', type: 'double' },
+    scrapper: { name: 'TALONIX', move: 'CLAW STRIKE', stage: 'teen', stats: S(55, 60, 45, 45), special: { name: 'TALON RUSH', type: 'double' },
                 traits: { cheer: 0.5, temper: 0.7, lazy: 0.1 }, desc: 'Battered raptor. Never stays down.' },
-    muck:     { name: 'MUCKSPAWN', move: 'MUCK SPIT', stage: 'teen', stats: S(5, 2, 2, 1), special: { name: 'SLIME COAT', type: 'absorb' },
+    muck:     { name: 'MUCKSPAWN', move: 'MUCK SPIT', stage: 'teen', stats: S(65, 45, 50, 35), special: { name: 'SLIME COAT', type: 'absorb' },
                 traits: { cheer: 0.3, temper: 0.4, lazy: 0.8 }, desc: 'Crawled out of its own filth.' },
-    blobbo:   { name: 'MIREBACK', move: 'TACKLE', stage: 'teen', stats: S(5, 2, 3, 1), special: { name: 'MUD SHELL', type: 'absorb' },
+    blobbo:   { name: 'MIREBACK', move: 'TACKLE', stage: 'teen', stats: S(65, 45, 60, 30), special: { name: 'MUD SHELL', type: 'absorb' },
                 traits: { cheer: 0.5, temper: 0.3, lazy: 0.8 }, desc: 'Overfed, moss-shelled brute.' },
-    nekoru:   { name: 'LYNXAR', move: 'SLASH', stage: 'teen', stats: S(4, 2, 2, 3), special: { name: 'SHADOW CLAW', type: 'double' },
+    nekoru:   { name: 'LYNXAR', move: 'SLASH', stage: 'teen', stats: S(55, 50, 50, 60), special: { name: 'SHADOW CLAW', type: 'double' },
                 traits: { cheer: 0.6, temper: 0.2, lazy: 0.4 }, desc: 'Noble prowler. Raised with care.' },
-    kuchibo:  { name: 'GNASHER', move: 'BITE', stage: 'teen', stats: S(4, 2, 2, 2), special: { name: 'CRUNCH', type: 'double' },
+    kuchibo:  { name: 'GNASHER', move: 'BITE', stage: 'teen', stats: S(50, 50, 45, 45), special: { name: 'CRUNCH', type: 'double' },
                 traits: { cheer: 0.4, temper: 0.5, lazy: 0.4 }, desc: 'Swamp biter. Nothing special... yet.' },
 
     // ---- finals (stage "adult")
-    seraphi:  { name: 'WARSERAPH', move: 'HOLY LANCE', stage: 'adult', stats: S(6, 4, 4, 4), special: { name: 'JUDGEMENT', type: 'double' },
+    seraphi:  { name: 'WARSERAPH', move: 'HOLY LANCE', stage: 'adult', stats: S(95, 90, 90, 85), special: { name: 'JUDGEMENT', type: 'double' },
                 traits: { cheer: 0.6, temper: 0.4, lazy: 0.1 }, desc: 'Archangel of war. Disciplined victor.' },
-    noxseraph:{ name: 'NOXSERAPH', move: 'BLACK LANCE', stage: 'adult', stats: S(5, 5, 2, 4), special: { name: 'FALLEN HALO', type: 'drain' },
+    noxseraph:{ name: 'NOXSERAPH', move: 'BLACK LANCE', stage: 'adult', stats: S(70, 100, 60, 90), special: { name: 'FALLEN HALO', type: 'drain' },
                 traits: { cheer: 0.1, temper: 0.8, lazy: 0.3 }, desc: 'Fallen seraph. Power without restraint.' },
-    dreadclaw:{ name: 'DREADCLAW', move: 'REND', stage: 'adult', stats: S(6, 5, 3, 2), special: { name: 'SAVAGE RUSH', type: 'double' },
+    dreadclaw:{ name: 'DREADCLAW', move: 'REND', stage: 'adult', stats: S(85, 100, 70, 65), special: { name: 'SAVAGE RUSH', type: 'double' },
                 traits: { cheer: 0.4, temper: 0.7, lazy: 0.1 }, desc: 'Scarred apex raptor. Learned to win.' },
-    oyaji:    { name: 'GRIMTUSK', move: 'TUSK GORE', stage: 'adult', stats: S(6, 3, 3, 2), special: { name: 'WAR GRUNT', type: 'stun' },
+    oyaji:    { name: 'GRIMTUSK', move: 'TUSK GORE', stage: 'adult', stats: S(80, 70, 70, 60), special: { name: 'WAR GRUNT', type: 'stun' },
                 traits: { cheer: 0.2, temper: 0.8, lazy: 0.6 }, desc: 'Scarred elder boar. Bitter from defeat.' },
-    sludgeking:{ name: 'SLUDGE KING', move: 'SLUDGE SLAM', stage: 'adult', stats: S(7, 3, 4, 1), special: { name: 'TOXIC FLOOD', type: 'drain' },
+    sludgeking:{ name: 'SLUDGE KING', move: 'SLUDGE SLAM', stage: 'adult', stats: S(95, 65, 80, 40), special: { name: 'TOXIC FLOOD', type: 'drain' },
                 traits: { cheer: 0.3, temper: 0.5, lazy: 0.9 }, desc: 'Crowned in muck. Rules the filth.' },
-    toxitan:  { name: 'TOXITAN', move: 'ACID FIST', stage: 'adult', stats: S(7, 4, 4, 1), special: { name: 'CORRODE', type: 'stun' },
+    toxitan:  { name: 'TOXITAN', move: 'ACID FIST', stage: 'adult', stats: S(100, 85, 85, 50), special: { name: 'CORRODE', type: 'stun' },
                 traits: { cheer: 0.3, temper: 0.6, lazy: 0.4 }, desc: 'Toxic colossus of sludge and stone.' },
-    rokkun:   { name: 'BASTION', move: 'ROCK FIST', stage: 'adult', stats: S(6, 3, 5, 1), special: { name: 'IRON WALL', type: 'guard' },
+    rokkun:   { name: 'BASTION', move: 'ROCK FIST', stage: 'adult', stats: S(90, 70, 110, 50), special: { name: 'IRON WALL', type: 'guard' },
                 traits: { cheer: 0.3, temper: 0.3, lazy: 0.4 }, desc: 'Rune-cored golem. Trained hard.' },
-    chubbo:   { name: 'BEHEMOTH', move: 'HORN BASH', stage: 'adult', stats: S(7, 2, 4, 1), special: { name: 'BULWARK', type: 'absorb' },
+    chubbo:   { name: 'BEHEMOTH', move: 'HORN BASH', stage: 'adult', stats: S(100, 55, 85, 40), special: { name: 'BULWARK', type: 'absorb' },
                 traits: { cheer: 0.6, temper: 0.2, lazy: 0.9 }, desc: 'Tusked colossus. Fed far too well.' },
-    starla:   { name: 'LUMISTAG', move: 'ANTLER RAM', stage: 'adult', stats: S(5, 3, 3, 4), special: { name: 'STARLIGHT', type: 'heal' },
+    starla:   { name: 'LUMISTAG', move: 'ANTLER RAM', stage: 'adult', stats: S(90, 85, 85, 100), special: { name: 'STARLIGHT', type: 'heal' },
                 traits: { cheer: 0.9, temper: 0.05, lazy: 0.2 }, desc: 'Star-antlered stag. Flawless care.' },
-    kingleo:  { name: 'KAISERON', move: 'FANG STRIKE', stage: 'adult', stats: S(5, 4, 3, 3), special: { name: "KING'S ROAR", type: 'double' },
+    kingleo:  { name: 'KAISERON', move: 'FANG STRIKE', stage: 'adult', stats: S(80, 85, 75, 80), special: { name: "KING'S ROAR", type: 'double' },
                 traits: { cheer: 0.5, temper: 0.5, lazy: 0.2 }, desc: 'Crowned lion-dragon. Noble blood.' },
-    mimiko:   { name: 'GALEHARE', move: 'BLADE TAIL', stage: 'adult', stats: S(4, 3, 2, 5), special: { name: 'GALE STEP', type: 'dodge' },
+    mimiko:   { name: 'GALEHARE', move: 'BLADE TAIL', stage: 'adult', stats: S(60, 70, 55, 95), special: { name: 'GALE STEP', type: 'dodge' },
                 traits: { cheer: 0.8, temper: 0.2, lazy: 0.1 }, desc: 'Blade-tailed wind jackal.' },
-    ghoulie:  { name: 'WRAITH', move: 'SHADE CLAW', stage: 'adult', stats: S(4, 4, 2, 3), special: { name: 'SOUL DRAIN', type: 'drain' },
+    ghoulie:  { name: 'WRAITH', move: 'SHADE CLAW', stage: 'adult', stats: S(65, 85, 55, 75), special: { name: 'SOUL DRAIN', type: 'drain' },
                 traits: { cheer: 0.2, temper: 0.7, lazy: 0.5 }, desc: 'Born of neglect. Hungers.' },
-    drakon:   { name: 'DRAKON', move: 'CLAW STRIKE', stage: 'adult', secret: true, stats: S(7, 5, 4, 4), special: { name: 'INFERNO', type: 'inferno' },
+    drakon:   { name: 'DRAKON', move: 'CLAW STRIKE', stage: 'adult', secret: true, stats: S(110, 115, 95, 100), special: { name: 'INFERNO', type: 'inferno' },
                 traits: { cheer: 0.5, temper: 0.6, lazy: 0.1 }, desc: 'SECRET: undefeated dragon.' }
   };
 
