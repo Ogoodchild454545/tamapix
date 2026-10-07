@@ -357,8 +357,8 @@
     }
     drawPoops(t);
     if (state.job) {                                   // away at work: an empty meadow and a sign
-      S.label('Away at work: ' + state.job.name, 6, UI.text);
-      S.label(fmtDur(jobLeft()) + ' left. Tap to check.', 20, UI.dim);
+      const yb = S.label('Away at work: ' + state.job.name, 6, UI.text);
+      S.label(fmtDur(jobLeft()) + ' left. Tap to check.', Math.max(20, yb + 4), UI.dim);
       if (!noZones) zone(-20, -10, W + 40, H + 20, () => { ui.mode = 'jobs'; }, { x: 8, y: 3, w: W - 16, h: 30 }, 'away');
       return;
     }
@@ -474,64 +474,65 @@
   function drawStatus(t) {
     const s = state, f = T.FORMS[s.formId];
     drawMain(t, true); dim();
-    const x = 4, y = -58, w = 88, h = 106;
+    const b = S.bounds(), x = 3, w = W - 6, y = Math.max(b.top + 2, -58), h = Math.max(96, Math.min(106, b.bottom - 2 - y));
     S.panel(x, y, w, h);
+    const fit = (str, cx0) => fitText(str, x + w - 5 - cx0);
     const titles = ['PROFILE', 'CARE', 'ENERGY', 'WALLET', 'RECORD'];
     S.textMid(titles[ui.page], x + 5, y + 2, 12, UI.accent);
-    S.textMid((ui.page + 1) + '/' + STATUS_PAGES, x + w - 5 - S.textW('5/5'), y + 2, 12, UI.dim);
+    const pgS = (ui.page + 1) + '/' + STATUS_PAGES; S.textMid(pgS, x + w - 5 - S.textW(pgS), y + 2, 12, UI.dim);
     S.rule(x + 4, y + 15, w - 8);
     const cx = x + 5, cy = y + 21, X = T.Battle, L = Pet.level(s);
     switch (ui.page) {
       case 0: {
         const k = petKey(), a = sz(k);
         if (s.stage !== 'egg') S.art(k, x + w - a.w - 5, y + 74 - a.h, { frame: S.frame });
-        S.text(s.name, cx, cy, UI.text);
-        S.text(f.name, cx, cy + 10, UI.accent);
-        S.text('Lv ' + L + ' / ' + E.levelCap(s.stage), cx, cy + 22, UI.text);
+        S.text(fit(s.name, cx), cx, cy, UI.text);
+        S.text(fit(f.name, cx), cx, cy + 10, UI.accent);
+        S.text(fit('Lv ' + L + ' / ' + E.levelCap(s.stage), cx), cx, cy + 22, UI.text);
         const lo = X.xpFor(L), hi = X.xpFor(L + 1), pr = L >= X.XP.MAX_LEVEL ? 1 : (s.xp - lo) / Math.max(1, hi - lo);
         bar(cx, cy + 31, 34, pr, UI.blue);
-        S.text('XP ' + s.xp, cx, cy + 38, UI.dim);
-        S.text('Age ' + fmtDur(s.ageMs), cx, cy + 48, UI.dim);
+        S.text(fit('XP ' + s.xp, cx), cx, cy + 38, UI.dim);
+        S.text(fit('Age ' + fmtDur(s.ageMs), cx), cx, cy + 48, UI.dim);
         S.rect(x + 5, y + 78, w - 10, 1, UI.inner);
-        S.text(evolveLine(s), cx, y + 83, Pet.evolvesIn(s) == null ? UI.dim : UI.text);
+        S.text(fit(evolveLine(s), cx), cx, y + 83, Pet.evolvesIn(s) == null ? UI.dim : UI.text);
         break;
       }
       case 1:
-        S.text('Hunger', cx, cy, UI.dim); pips(cx, cy + 9, s.hunger, 4, UI.accent);
-        S.text('Mood', cx, cy + 20, UI.dim); pips(cx, cy + 29, s.happy, 4, UI.blue);
-        S.text('Weight ' + s.weight + '   Mistakes ' + s.careMistakes, cx, cy + 42, UI.dim);
-        S.text(s.sick ? 'Sick!' : s.poops.length ? 'Needs cleaning' : 'Healthy', cx, cy + 54, s.sick ? UI.red : UI.text);
+        S.text(fit('Hunger', cx), cx, cy, UI.dim); pips(cx, cy + 9, s.hunger, 4, UI.accent);
+        S.text(fit('Mood', cx), cx, cy + 20, UI.dim); pips(cx, cy + 29, s.happy, 4, UI.blue);
+        S.text(fit('Weight ' + s.weight + '   Mistakes ' + s.careMistakes, cx), cx, cy + 42, UI.dim);
+        S.text(fit(s.sick ? 'Sick!' : s.poops.length ? 'Needs cleaning' : 'Healthy', cx), cx, cy + 54, s.sick ? UI.red : UI.text);
         break;
       case 2: {
-        const EN = C.ENERGY;
-        S.text('Energy ' + energy() + ' / ' + EN.MAX, cx, cy, UI.text);
-        bar(cx, cy + 10, 72, (s.energy || 0) / EN.MAX, UI.yellow);
+        const EN = C.ENERGY, nActs = eco ? eco.daily.actions : 0;
+        S.text(fit('Energy ' + energy() + ' / ' + EN.MAX, cx), cx, cy, UI.text);
+        bar(cx, cy + 10, w - 12, (s.energy || 0) / EN.MAX, UI.yellow);
         const st = s.job ? 'At work' : s.asleep ? (s.lightsOff ? 'Sleeping +' + EN.SLEEP_PER_H + '/h' : 'Napping +' + EN.NAP_PER_H + '/h') : 'Awake';
-        S.text(st, cx, cy + 20, UI.text);
+        S.text(fit(st, cx), cx, cy + 20, UI.text);
         const full = (EN.MAX - (s.energy || 0)) / EN.SLEEP_PER_H * HOUR;
-        S.text(s.energy >= EN.MAX ? 'Full.' : 'Lights off: full in ' + fmtDur(full), cx, cy + 32, UI.dim);
-        S.text('XP now x' + (eco ? eco.taperMult : 1) + ' (' + (eco ? eco.daily.actions : 0) + ' actions)', cx, cy + 44, UI.dim);
-        S.text('Fizz today ' + (eco ? eco.daily.drinks : 0) + '/' + E.sku('fizz').perDay, cx, cy + 54, UI.dim);
+        S.text(fit(s.energy >= EN.MAX ? 'Full.' : 'Lights off: full in ' + fmtDur(full), cx), cx, cy + 32, UI.dim);
+        S.text(fit('XP now x' + (eco ? eco.taperMult : 1) + ' (' + nActs + (nActs === 1 ? ' action)' : ' actions)'), cx), cx, cy + 44, UI.dim);
+        S.text(fit('Fizz today ' + (eco ? eco.daily.drinks : 0) + '/' + E.sku('fizz').perDay, cx), cx, cy + 54, UI.dim);
         break;
       }
       case 3: {
         const inv = (eco && eco.inventory) || {};
-        S.text('Coins ' + (eco ? eco.coins : 0), cx, cy, UI.accent);
-        S.text('Ore ' + (inv.ore || 0), cx, cy + 10, UI.text);
-        S.text('Pickaxe ' + ['I', 'II', 'III'][(inv.pickaxe || 1) - 1] + ' (+' + Math.round(E.workBonus(inv) * 100) + '%)', cx, cy + 20, UI.text);
-        S.text('Battle coins today', cx, cy + 32, UI.dim);
-        S.text((eco ? eco.daily.battleCoins : 0) + ' / ' + E.COINS.battleCapPerDay, cx, cy + 41, UI.dim);
-        S.text('Login gift day ' + (((eco && eco.gift.idx) || 0) || 7) + '/7', cx, cy + 52, UI.dim);
+        S.text(fit('Coins ' + (eco ? eco.coins : 0), cx), cx, cy, UI.accent);
+        S.text(fit('Ore ' + (inv.ore || 0), cx), cx, cy + 10, UI.text);
+        S.text(fit('Pickaxe ' + ['I', 'II', 'III'][(inv.pickaxe || 1) - 1] + ' (+' + Math.round(E.workBonus(inv) * 100) + '%)', cx), cx, cy + 20, UI.text);
+        S.text(fit('Battle coins today', cx), cx, cy + 32, UI.dim);
+        S.text(fit((eco ? eco.daily.battleCoins : 0) + ' / ' + E.COINS.battleCapPerDay, cx), cx, cy + 41, UI.dim);
+        S.text(fit('Login gift day ' + (((eco && eco.gift.idx) || 0) || 7) + '/7', cx), cx, cy + 52, UI.dim);
         break;
       }
       case 4: {
         const st = s.st || {};
-        S.text('Wins ' + s.wins + '  Losses ' + (s.battles - s.wins), cx, cy, UI.text);
-        S.text('Training ' + s.training, cx, cy + 10, UI.text);
-        S.text('This stage: W' + (st.wins || 0) + ' L' + (st.losses || 0), cx, cy + 22, UI.dim);
-        S.text('Discipline ' + s.discipline + '%', cx, cy + 32, UI.dim);
-        if (f.move) S.text('Move: ' + f.move, cx, cy + 44, UI.dim);
-        if (f.special) S.text('Special: ' + f.special.name, cx, cy + 54, UI.dim);
+        S.text(fit('Wins ' + s.wins + '  Losses ' + (s.battles - s.wins), cx), cx, cy, UI.text);
+        S.text(fit('Training ' + s.training, cx), cx, cy + 10, UI.text);
+        S.text(fit('This stage: W' + (st.wins || 0) + ' L' + (st.losses || 0), cx), cx, cy + 22, UI.dim);
+        S.text(fit('Discipline ' + s.discipline + '%', cx), cx, cy + 32, UI.dim);
+        if (f.move) S.text(fit('Move: ' + f.move, cx), cx, cy + 44, UI.dim);
+        if (f.special) S.text(fit('Special: ' + f.special.name, cx), cx, cy + 54, UI.dim);
         break;
       }
     }
@@ -632,7 +633,7 @@
       const j = state.job, x = 3, w = W - 6, y = Math.max(b.top + 2, -60), h = 72, total = (j.endT - j.startT) || 1;
       S.panel(x, y, w, h);
       S.textMid('AT WORK', x + 5, y + 2, 11, UI.accent);
-      S.textMid(j.name, x + w - 5 - S.textW(j.name), y + 2, 11, UI.text);
+      const jn = fitText(j.name, w - 16 - S.textW('AT WORK')); S.textMid(jn, x + w - 5 - S.textW(jn), y + 2, 11, UI.text);
       S.rule(x + 4, y + 14, w - 8);
       bar(x + 5, y + 18, w - 10, 1 - jobLeft() / total, UI.accent);
       S.text('Back in ' + fmtDur(jobLeft()), x + 5, y + 27, UI.text);
@@ -876,12 +877,13 @@
   }
   function drawPlay(t) {
     const P = ui.play, key = petKey(), b = sz(key), cx = Math.floor((W - b.w) / 2);
-    S.label('TRAINING  ' + P.round + '/5   HITS ' + P.score, -26, UI.text);
+    const top = Math.max(S.bounds().top + 4, -26);
+    const below = S.label('Training ' + P.round + '/5  ·  Hits ' + P.score, top, UI.text);
     if (P.phase === 'wait' || P.phase === 'sending') {
       drawPet(key, cx, groundY(key), false);
       const hl = ui.lastInput === 'key' && blink(t, 500);
       S.button(0, 8, 16, 24, '<', hl); S.button(W - 16, 8, 16, 24, '>', ui.lastInput === 'key' && !hl);
-      S.textC('Which way will it dodge?', -10, UI.dim);
+      S.label('Which way will it dodge?', below + 4, UI.dim);
       zone(-20, -40, W / 2 + 20, H + 60, () => playGuess(-1), { x: 0, y: 8, w: 16, h: 24 }, 'left');
       zone(W / 2, -40, W / 2 + 20, H + 60, () => playGuess(1), { x: W - 16, y: 8, w: 16, h: 24 }, 'right');
     } else if (P.phase === 'reveal') {
@@ -1455,6 +1457,7 @@
     }
     if (ui.toast) drawToast(t);
     if (ui.tapFx && t < ui.tapFx.until) S.flash(ui.tapFx.x, ui.tapFx.y, ui.tapFx.w, ui.tapFx.h);
+    S.flush();
   }
   function renderHUD() {
     if (!hud.feed || !ui) return;

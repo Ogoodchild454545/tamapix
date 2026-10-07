@@ -51,7 +51,30 @@
     this.W = C.STAGE_W; this.H = C.STAGE_H;
     this.scale = 4; this.sw = 96; this.sh = 200; this.sx0 = 0; this.sy0 = 90; this.horizon = 100; this.top = 0; this.bot = 0;
     this.bgCache = null; this.frame = 0;
+    // UI text is drawn on a full-resolution overlay canvas with a system font (crisp at any DPR).
+    this.tc = document.createElement('canvas'); this.tc.id = 'sceneText'; this.tc.setAttribute('aria-hidden', 'true');
+    this.tc.style.cssText = 'position:fixed;left:0;top:0;pointer-events:none;';
+    if (canvas.parentNode) canvas.parentNode.insertBefore(this.tc, canvas.nextSibling);
+    this.tctx = this.tc.getContext('2d'); this.tq = []; this.dpr = 1;
   }
+  // ---- UI font: sizes are in stage pixels so layout scales with the scene
+  const FONT_FAMILY = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+  const FS = 4.4;                                   // font size (stage px); ~17-18 CSS px on a phone
+  const isCaps = (s) => /[A-Z]/.test(s) && s === s.toUpperCase();
+  const fontFor = (s, px) => (isCaps(s) ? '700 ' : '500 ') + px + 'px ' + FONT_FAMILY;
+  const mctx = document.createElement('canvas').getContext('2d');
+  const wCache = new Map();
+  function measure(s) {
+    s = String(s);
+    let w = wCache.get(s);
+    if (w == null) {
+      if (wCache.size > 3000) wCache.clear();
+      mctx.font = fontFor(s, 100); w = mctx.measureText(s).width / 100 * FS;
+      wCache.set(s, w);
+    }
+    return w;
+  }
+  T.textWidth = measure;
   const P = Scene.prototype;
 
   P.resize = function (vw, vh, topPx, botPx) {
@@ -67,6 +90,9 @@
     this.c.width = this.sw; this.c.height = this.sh;
     const cw = this.sw * s, ch = this.sh * s;
     Object.assign(this.c.style, { width: cw + 'px', height: ch + 'px', left: Math.floor((vw - cw) / 2) + 'px', top: '0px' });
+    this.dpr = Math.min(3, window.devicePixelRatio || 1);
+    this.tc.width = Math.round(cw * this.dpr); this.tc.height = Math.round(ch * this.dpr);
+    Object.assign(this.tc.style, { width: cw + 'px', height: ch + 'px', left: this.c.style.left, top: '0px' });
     this.bgCache = null;
     this.ctx.imageSmoothingEnabled = false;
   };
@@ -82,6 +108,7 @@
   // ------------------------------------------------------------ background
   P.begin = function (t, env) {
     this.env = env; this.t = t; this.frame = Math.floor(t / 650) % 2;
+    this.tq = [];
     const ctx = this.ctx;
     ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1;
     const key = env + this.sw + 'x' + this.sh + ':' + this.sy0 + ':' + this.top + ':' + this.bot;
@@ -348,12 +375,35 @@
   };
 
   // ------------------------------------------------------------ UI primitives
-  P.rect = function (x, y, w, h, c) { this.ctx.fillStyle = c || UI.text; this.ctx.fillRect(x, y, w, h); };
+  /** Map stage coords to low-res canvas pixels with the current transform. */
+  P._pt = function (x, y) { const m = this.ctx.getTransform(); return [m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f]; };
+  /** Anything painted over queued text must hide/tint it on the text layer too. */
+  P._cover = function (x, y, w, h, fill) {
+    if (!this.tq.length) return;
+    const [ax, ay] = this._pt(x, y), [bx, by] = this._pt(x + w, y + h);
+    this.tq.push({ k: fill ? 'fill' : 'clear', x: Math.min(ax, bx), y: Math.min(ay, by), w: Math.abs(bx - ax), h: Math.abs(by - ay), c: fill, a: this.ctx.globalAlpha });
+  };
+  /** Paint the queued UI text (call once at the end of each frame). */
+  P.flush = function () {
+    const g = this.tctx, k = this.scale * this.dpr;
+    g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, this.tc.width, this.tc.height);
+    g.setTransform(k, 0, 0, k, 0, 0); g.textBaseline = 'alphabetic';
+    for (const o of this.tq) {
+      g.globalAlpha = o.a;
+      if (o.k === 'clear') g.clearRect(o.x, o.y, o.w, o.h);
+      else if (o.k === 'fill') { g.fillStyle = o.c; g.fillRect(o.x, o.y, o.w, o.h); }
+      else { g.font = fontFor(o.s, FS); g.fillStyle = o.c; g.fillText(o.s, o.x, o.y); }
+    }
+    g.globalAlpha = 1;
+  };
+  P.rect = function (x, y, w, h, c) { this.ctx.fillStyle = c || UI.text; this.ctx.fillRect(x, y, w, h); if (w * h >= 4) this._cover(x, y, w, h, /rgba/.test(c || '') ? c : null); };
   P.frame = function (x, y, w, h, c) { this.rect(x, y, w, 1, c); this.rect(x, y + h - 1, w, 1, c); this.rect(x, y, 1, h, c); this.rect(x + w - 1, y, 1, h, c); };
   P.textW = function (s) { return T.textWidth(s); };
+  /** UI text. (x, y) = top-left of the old 7px glyph cell; the real font is centred on that cell. */
   P.text = function (s, x, y, c) {
-    let cx = Math.round(x);
-    for (const ch of String(s)) { const gl = T.FONT[ch] || T.FONT['?']; this.glyph(gl, cx, y, c || UI.text); cx += gl.w + 1; }
+    s = String(s); if (!s) return;
+    const [px, py] = this._pt(x, y + 3.5 + FS * 0.36);
+    this.tq.push({ k: 'text', s, x: px, y: py, c: c || UI.text, a: this.ctx.globalAlpha });
   };
   P.textC = function (s, y, c, x0, w) { x0 = x0 || 0; w = w || this.W; this.text(s, x0 + Math.floor((w - this.textW(s)) / 2), y, c); };
   /** Word-wrap to lines no wider than w. */
@@ -369,10 +419,12 @@
   /** Flat slate panel: fill + single 1px border (no double-edge chrome). accent: highlight border. */
   P.panel = function (x, y, w, h, accent, fill) {
     const g = this.ctx;
+    const x2 = Math.round(x + w), y2 = Math.round(y + h); x = Math.round(x); y = Math.round(y); w = x2 - x; h = y2 - y;   // text widths are fractional
     g.fillStyle = fill || UI.panel; g.fillRect(x, y, w, h);
     g.fillStyle = accent || UI.border;
     g.fillRect(x, y, w, 1); g.fillRect(x, y + h - 1, w, 1);
     g.fillRect(x, y, 1, h); g.fillRect(x + w - 1, y, 1, h);
+    this._cover(x, y, w, h, null);
   };
   /** 1px rule used under titles / between rows. */
   P.rule = function (x, y, w, c) { this.rect(x, y, w, 1, c || UI.inner); };
@@ -385,6 +437,7 @@
     const w = tw + 8, x = cx != null ? Math.round(cx - w / 2) : Math.floor((this.W - w) / 2);
     this.panel(x, y - 2, w, 11 + (lines.length - 1) * 9);
     lines.forEach((l, i) => this.text(l, x + 4 + Math.floor((tw - this.textW(l)) / 2), y + i * 9, c));
+    return y - 2 + 11 + (lines.length - 1) * 9;       // bottom edge of the panel
   };
   P.button = function (x, y, w, h, label, hi, color) {
     this.panel(x, y, w, h, hi ? UI.accent : null);
@@ -399,8 +452,12 @@
     const fw = Math.round((w - 12) * r);
     if (fw > 0) { this.rect(bx + 1, y + 1, fw, 3, col); this.rect(bx + 1, y + 1, fw, 1, 'rgba(255,255,255,0.25)'); }
   };
-  P.flash = function (x, y, w, h, c) { this.ctx.fillStyle = c || 'rgba(224,173,72,0.35)'; this.ctx.fillRect(x, y, w, h); };
-  P.overlay = function (c) { const g = this.ctx; g.save(); g.setTransform(1, 0, 0, 1, 0, 0); g.fillStyle = c; g.fillRect(0, 0, this.sw, this.sh); g.restore(); };
+  P.flash = function (x, y, w, h, c) { this.ctx.fillStyle = c || 'rgba(224,173,72,0.35)'; this.ctx.fillRect(x, y, w, h); this._cover(x, y, w, h, this.ctx.fillStyle); };
+  P.overlay = function (c) {
+    const g = this.ctx; g.save(); g.setTransform(1, 0, 0, 1, 0, 0); g.fillStyle = c; g.fillRect(0, 0, this.sw, this.sh);
+    if (this.tq.length) this.tq.push({ k: 'fill', x: 0, y: 0, w: this.sw, h: this.sh, c, a: g.globalAlpha });
+    g.restore();
+  };
   P.UI = UI;
 
   /** 1-bit icon on its own canvas (HUD buttons). */
